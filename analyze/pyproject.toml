@@ -1,0 +1,19 @@
+[project]
+name = "spotter-analyze"
+version = "0.1.0"
+description = "Reduce Spotter .spot telemetry from KovaaK's into coach-readable reports"
+requires-python = ">=3.11"
+dependencies = ["numpy", "matplotlib"]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["spotter_analyze"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
