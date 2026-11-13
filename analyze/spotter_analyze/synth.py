@@ -22,7 +22,8 @@ def _frame_times(rng, duration: float, fps: float) -> np.ndarray:
 
 
 def tracking(seed: int = 0, duration: float = 30.0, fps: float = 360.0, lag: float = 0.10,
-             speed: float = 20.0, radius: float = 60.0, smooth_turns: bool = False) -> Run:
+             speed: float = 20.0, radius: float = 60.0, smooth_turns: bool = False,
+             tremor_deg: float = 0.0, tremor_hz: float = 10.0, tremor_grow: float = 0.0) -> Run:
     """One target strafing left/right at `speed` deg/s, reversing at random. The crosshair
     replays the target's path `lag` seconds late. `smooth_turns` eases each reversal with a
     sinusoidal yaw path and a small vertical bob, like Smoothsphere's targets."""
@@ -49,7 +50,11 @@ def tracking(seed: int = 0, duration: float = 30.0, fps: float = 360.0, lag: flo
         return 3.0 * np.sin(2 * np.pi * 0.37 * tt) if smooth_turns else np.zeros_like(tt)
 
     tyaw, tpitch = path_yaw(t), path_pitch(t)
-    yaw = path_yaw(t - lag) + 0.02 * rng.standard_normal(n)
+    # Hand tremor: a sinusoid of `tremor_deg` amplitude whose size grows by `tremor_grow`
+    # (fraction) from the start to the end of the run, with a wandering phase.
+    phase = 2 * np.pi * tremor_hz * t + np.cumsum(0.05 * rng.standard_normal(n))
+    shake = tremor_deg * (1 + tremor_grow * t / duration) * np.sin(phase)
+    yaw = path_yaw(t - lag) + shake + 0.02 * rng.standard_normal(n)
     pitch = path_pitch(t - lag) + 0.02 * rng.standard_normal(n)
     return Run(
         t=t, yaw=yaw, pitch=pitch, fov=np.full(n, 103.0), cam=np.zeros((n, 3)),
@@ -67,15 +72,19 @@ def _min_jerk(u):
 
 
 def clicking(seed: int = 0, kills: int = 40, fps: float = 360.0, react: float = 0.18,
-             reach: float = 0.85, radius: float = 25.0, early_every: int = 5) -> Run:
+             reach: float = 0.85, radius: float = 25.0, early_every: int = 5,
+             lockout_deg: float = 0.0) -> Run:
     """One static target at a time. Each kill: wait `react`, flick `reach` of the way
     (0.85 = 15% short), pause, correct onto the centre, confirm 50 ms, shoot.
-    Every `early_every`-th kill also fires once at the end of the short first flick."""
+    Every `early_every`-th kill also fires once at the end of the short first flick.
+    `lockout_deg`: after each flick stops, a 10 Hz shake that decays over ~80 ms, with this
+    amplitude per 30 deg of flick (bigger flicks, bigger shake)."""
     rng = np.random.default_rng(seed)
     dt = 1.0 / fps
     cur = np.array([0.0, 0.0])        # crosshair yaw, pitch
     t_now, shots = 0.0, 0
     T, YAW, PITCH, SHOTS, BTN, TGT = [], [], [], [], [], []
+    stops: list[tuple[float, float]] = []
 
     def emit(pos, target, fire=False):
         nonlocal t_now, shots
@@ -100,6 +109,7 @@ def clicking(seed: int = 0, kills: int = 40, fps: float = 360.0, react: float = 
         steps = int(move * fps)
         for i in range(1, steps + 1):
             emit(start + _min_jerk(i / steps) * (landing - start), target)
+        stops.append((t_now, dist))
         if early_every and k % early_every == early_every - 1:
             emit(landing, target, fire=True)
         for _ in range(int(0.06 * fps)):
@@ -115,6 +125,14 @@ def clicking(seed: int = 0, kills: int = 40, fps: float = 360.0, react: float = 
         emit(tgt, None, fire=True)
 
     n = len(T)
+    if lockout_deg:
+        tt = np.array(T)
+        shake = np.zeros(n)
+        for ts, dist in stops:
+            u = tt - ts
+            m = (u > 0) & (u < 0.4)
+            shake[m] += lockout_deg * dist / 30 * np.exp(-u[m] / 0.08) * np.sin(2 * np.pi * 10 * u[m])
+        YAW = list(np.array(YAW) + shake)
     rows = [(i, tg[0], tg[1]) for i, tg in enumerate(TGT) if tg is not None]
     angles = np.array([r[2] for r in rows])
     return Run(

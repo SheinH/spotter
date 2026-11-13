@@ -70,7 +70,8 @@ def parse_stats(path: str | Path) -> Stats:
 
 
 def find_stats(stats_dir: Path, wall_start: float, wall_end: float) -> list[Stats]:
-    """Stats files for runs that lie inside [wall_start, wall_end] (Unix seconds), oldest first."""
+    """Stats files for runs that overlap [wall_start, wall_end] (Unix seconds), oldest first.
+    A run the log only caught part of (hook injected mid-run) still counts."""
     found = []
     if not stats_dir.is_dir():
         return found
@@ -82,7 +83,7 @@ def find_stats(stats_dir: Path, wall_start: float, wall_end: float) -> list[Stat
             st = parse_stats(p)
         except (ValueError, IndexError):
             continue
-        if st.start.timestamp() >= wall_start - 1 and st.end.timestamp() <= wall_end + 2:
+        if st.end.timestamp() > wall_start + 5 and st.start.timestamp() < wall_end - 5:
             found.append(st)
     return sorted(found, key=lambda s: s.end)
 

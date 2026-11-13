@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from spotter_analyze import clicking, kovaaks, report, synth, tracking
+from spotter_analyze import clicking, kovaaks, report, synth, tension, tracking
 from spotter_analyze.__main__ import main, pick_mode
 from spotter_analyze.format import read_spot, write_spot
 
@@ -57,6 +57,29 @@ def test_tracking_finds_smooth_reversals(lag):
     assert len(res["plot"]["prof_c"]) > 10
 
 
+def test_tension_recovers_planted_tremor():
+    calm = tension.analyze(synth.tracking(lag=0.1, speed=40.0, smooth_turns=True), "tracking", None)
+    shaky = tension.analyze(synth.tracking(lag=0.1, speed=40.0, smooth_turns=True,
+                                           tremor_deg=0.05, tremor_grow=1.0), "tracking", None)
+    # 0.05 deg at 10 Hz, growing 1.0x -> 1.5x -> 2.0x amplitude: rms velocity 2*pi*10*A/sqrt(2)
+    base = 2 * math.pi * 10 * 0.05 / math.sqrt(2)
+    assert shaky["thirds"][0] == pytest.approx(base * 7 / 6, rel=0.15)
+    assert shaky["thirds"][2] == pytest.approx(base * 11 / 6, rel=0.15)
+    assert calm["jitter"] < 0.25 * shaky["jitter"]
+    assert shaky["peak_hz"] == pytest.approx(10, abs=1)
+    assert shaky["excess_db"] > calm["excess_db"] + 5
+
+
+def test_tension_flags_flick_rebound():
+    clean = tension.analyze(synth.clicking(kills=60), "clicking", None)
+    clamped = tension.analyze(synth.clicking(kills=60, lockout_deg=0.15), "clicking", None)
+    rb = tension.FLICK_COLS.index("rebound_pct")
+    assert np.median(clamped["flicks"][:, rb]) > 2 * np.median(clean["flicks"][:, rb])
+    dec, acc = tension.FLICK_COLS.index("decel_ms"), tension.FLICK_COLS.index("accel_ms")
+    # minimum-jerk flicks are symmetric
+    assert np.median(clean["flicks"][:, dec] / clean["flicks"][:, acc]) == pytest.approx(1.0, abs=0.1)
+
+
 def test_tracking_on_target_drops_with_lag():
     good = tracking.analyze(synth.tracking(lag=0.05))["on_pct"]
     bad = tracking.analyze(synth.tracking(lag=0.25))["on_pct"]
@@ -82,6 +105,30 @@ def test_clicking_overshoot_has_positive_landing():
     res = clicking.analyze(synth.clicking(kills=20, reach=1.2, early_every=0))
     assert np.median([r["land_r"] for r in res["table"]]) > 1.0
     assert res["misses"] == 0
+    t = res["table"]
+    # synth is past the edge for the end of the flick, a 60 ms pause, and most of the 80 ms way back
+    assert np.mean([r["over_r"] > 1.0 for r in t]) > 0.8
+    assert np.median([r["past_ms"] for r in t if r["over_r"] > 1.0]) == pytest.approx(160, abs=40)
+    assert res["metrics"]["over_pct"] > 80
+
+
+def test_undershoot_has_no_overflick():
+    res = clicking.analyze(synth.clicking(kills=20, reach=0.85, early_every=0))
+    assert all(r["past_ms"] == 0 for r in res["table"])
+    assert res["metrics"]["over_pct"] == 0
+
+
+def test_overflick_counts_pass_through_but_not_later_drift():
+    tt = np.arange(0, 400, 2.5)                      # 400 Hz, ms
+    # pass through the target (on for 20 ms), 50 ms beyond the edge, come back and settle
+    rem = np.interp(tt, [0, 40, 60, 110, 160, 400], [5, 1, -2.5, -2.5, 0, 0])
+    on = np.abs(rem) <= 1
+    over, past = clicking._overflick(rem, on, tt)
+    assert over == pytest.approx(2.5)
+    assert past == pytest.approx(80, abs=10)
+    # settled on target first, then drifted past: tracking error, not overflick
+    rem2 = np.where(tt < 200, 0.0, -3.0)
+    assert clicking._overflick(rem2, np.abs(rem2) <= 1, tt) == (0.0, 0.0)
 
 
 CSV = """Kill #,Timestamp,Bot,Weapon,TTK,Shots,Hits,Accuracy,Damage Done,Damage Possible,Efficiency,Cheated,OverShots
@@ -135,3 +182,57 @@ def test_cli_writes_report(tmp_path, kind):
     assert len(text) < 16000
     assert (out / "error_scatter.png").stat().st_size > 5000
     assert (out / "velocity_profiles.png").stat().st_size > 5000
+
+
+def test_mode_uses_stats_kill_count():
+    run = synth.tracking()
+    st = kovaaks.Stats(path=Path("x"), scenario="s", end=None, start=None, fields={"Kills": "0"})
+    assert pick_mode(run, st) == "tracking"
+    # without stats: no target ever lost health, so nothing can have been killed
+    assert pick_mode(run) == "tracking"
+
+
+def _join(a, b, gap=0.5):
+    """Two runs back to back in one log, with the shot counter reset between them."""
+    from dataclasses import replace
+    shift = a.t[-1] + gap
+    return replace(
+        a, t=np.r_[a.t, b.t + shift], yaw=np.r_[a.yaw, b.yaw], pitch=np.r_[a.pitch, b.pitch],
+        fov=np.r_[a.fov, b.fov], cam=np.r_[a.cam, b.cam], shots=np.r_[a.shots, b.shots],
+        buttons=np.r_[a.buttons, b.buttons], tgt_frame=np.r_[a.tgt_frame, b.tgt_frame + len(a.t)],
+        tgt_id=np.r_[a.tgt_id, b.tgt_id + 1000], tgt_pos=np.r_[a.tgt_pos, b.tgt_pos],
+        tgt_radius=np.r_[a.tgt_radius, b.tgt_radius], tgt_hh=np.r_[a.tgt_hh, b.tgt_hh],
+        tgt_health=np.r_[a.tgt_health, b.tgt_health])
+
+
+def test_runs_found_from_log_without_stats(tmp_path):
+    from spotter_analyze import spans
+    log = _join(synth.tracking(duration=30), synth.tracking(seed=1, duration=40))
+    found = spans.find_runs(log, tmp_path / "none")
+    assert [round(s.t1 - s.t0) for s in found] == [30, 40]
+    # a clicking run's one-frame gaps between kills stay inside the run
+    assert len(spans.target_spans(synth.clicking(kills=40))) == 1
+
+
+def test_noise_verdict():
+    from spotter_analyze import history
+    hist = [{"name": f"r{i}", "scenario": "s", "mode": "tracking", "score": 100.0 + i % 3,
+             "metrics": {"on_pct": 50.0 + (i % 3)}} for i in range(10)]
+    me = {"name": "me", "scenario": "s", "mode": "tracking", "score": 101.0, "metrics": {"on_pct": 51.5}}
+    cols, rows, n = history.noise_rows(me, hist)
+    assert n == 10 and rows[1][5] == "within noise"
+    me["metrics"]["on_pct"] = 60.0
+    assert history.noise_rows(me, hist)[1][1][5].startswith("higher (better)")
+
+
+def test_session_page(tmp_path):
+    from spotter_analyze import history, session
+    recs = []
+    for i in range(6):
+        res = tracking.analyze(synth.tracking(seed=i, lag=0.05 + 0.03 * i))
+        st = kovaaks.Stats(path=Path("x"), scenario="Synth", end=__import__("datetime").datetime(2026, 1, 1, 10, i),
+                           start=None, fields={"Score": str(1000 - 50 * i), "Horiz Sens": "30", "FOV": "103"})
+        recs.append(history.make_record(f"run{i}", "tracking", st, res, None))
+    text = session.write(tmp_path / "s", "Synth", recs, tmp_path / "none").read_text(encoding="utf-8")
+    assert "## Pooled across runs" in text and "## Trend" in text and "What moves with score" in text
+    assert "far behind" in text and "100-200" in text

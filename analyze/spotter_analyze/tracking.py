@@ -13,6 +13,20 @@ MOVE = 3.0          # deg/s; below this the target counts as stationary
 MAX_SEG = 1.5       # s; longer stretches without a reversal are split so the table keeps a time axis
 REV_WIN = 0.15      # s; a reversal compares target velocity this long before and after
 
+# Fixed bin edges (identical in every run so they pool across runs and sessions)
+SPEED_EDGES = [0, 25, 45, 65, 85, 105, np.inf]                       # target deg/s
+SPEED_LABELS = ["0-25", "25-45", "45-65", "65-85", "85-105", "105+"]
+ZONE_EDGES = [-np.inf, -1.0, -0.3, 0.3, 1.0, np.inf]                 # lead_r, target radii
+ZONE_LABELS = ["far behind", "behind", "centred", "ahead", "past"]
+SINCE_EDGES = [0, 100, 200, 300, 500, 800, np.inf]                   # ms since direction change
+SINCE_LABELS = ["0-100", "100-200", "200-300", "300-500", "500-800", "800+"]
+BIN_TITLES = {
+    "speed": ("By target speed (deg/s, fixed bands)", "tgt_dps"),
+    "position": ("Where the crosshair sits along the target's travel (radii: far behind <-1, "
+                 "behind -1..-0.3, centred +-0.3, ahead 0.3..1, past >1)", "zone"),
+    "since_rev": ("By time since the target's last direction change (ms)", "since_ms"),
+}
+
 COLUMNS = ["i", "t_s", "dur_ms", "rev", "dir", "tgt_dps", "on_pct", "lead_r", "cross_r",
            "react_ms", "gain", "revlag_r", "recov_ms"]
 LEGEND = (
@@ -131,7 +145,6 @@ def analyze(run: Run) -> dict:
 
     # --- whole-run numbers ---
     lag_ms = _xcorr_lag(tvx, tvy, cvx, cvy, valid) if moving.sum() > 0.2 * max(valid.sum(), 1) else float("nan")
-    tremor, jitter = _tremor(cvx - tvx, cvy - tvy, valid, dt)
     off = [(b - a) / FS * 1000 for a, b in runs(ok & ~on)]
     rev_rows = [r for r in table if r["rev"]]
 
@@ -151,7 +164,6 @@ def analyze(run: Run) -> dict:
         f"peak lag {med('revlag_r', rev_rows):.2f} radii, back on target after {med('recov_ms', rev_rows):.0f} ms",
         f"off-target episodes {len(off)}, median {np.median(off) if off else 0:.0f} ms, "
         f"longest {max(off) if off else 0:.0f} ms",
-        f"tremor: {tremor:.1f}% of 1-30 Hz error-velocity power sits in 8-12 Hz; jitter {jitter:.0f} deg/s^2 rms",
     ]
 
     # --- splits ---
@@ -171,15 +183,34 @@ def analyze(run: Run) -> dict:
                 rows_o.append([OCTANTS[o], 100.0 * len(ix) / len(mv), _pct(on[ix]),
                                np.nanmean(along_r[ix]), np.nanmean(np.abs(cross_r[ix]))])
         splits.append(("By target direction", ["dir", "time_pct", "on_pct", "lead_r", "cross_r"], rows_o))
-        q = np.quantile(tsp[mv], [1 / 3, 2 / 3])
-        if q[1] - q[0] > 2.0:
-            rows_s = []
-            for name, m in [(f"<{q[0]:.0f}", tsp[mv] < q[0]),
-                            (f"{q[0]:.0f}-{q[1]:.0f}", (tsp[mv] >= q[0]) & (tsp[mv] < q[1])),
-                            (f">{q[1]:.0f}", tsp[mv] >= q[1])]:
-                ix = mv[m]
-                rows_s.append([name, _pct(on[ix]), np.nanmean(along_r[ix]), np.nanmean(np.abs(cross_r[ix]))])
-            splits.append(("By target speed (deg/s)", ["tgt_dps", "on_pct", "lead_r", "cross_r"], rows_s))
+
+    # Fixed-edge bins, the same in every run, so runs and sessions can be pooled and compared.
+    def binned(ix, code, labels):
+        out = []
+        for j, lab in enumerate(labels):
+            s = ix[code == j]
+            lr = along_r[s]
+            lr = lr[~np.isnan(lr)]
+            out.append([lab, len(s) / FS, float(on[s].sum()) / FS, float(lr.sum()), len(lr)])
+        return out
+
+    bins: dict[str, list] = {}
+    if len(mv):
+        bins["speed"] = binned(mv, np.digitize(tsp[mv], SPEED_EDGES[1:-1]), SPEED_LABELS)
+        bins["position"] = binned(mv, np.digitize(along_r[mv], ZONE_EDGES[1:-1]), ZONE_LABELS)
+    vi = np.flatnonzero(valid)
+    if len(revs) and len(vi):
+        ra = np.array(revs)
+        last = np.searchsorted(ra, vi, side="right") - 1
+        since = np.where(last >= 0, (vi - ra[np.maximum(last, 0)]) / FS * 1000, np.nan)
+        # a respawn or gap since the last reversal resets the clock
+        block = np.maximum.accumulate(np.where(change, np.arange(n), 0))
+        since[(last < 0) | (ra[np.maximum(last, 0)] < block[vi])] = np.nan
+        code = np.where(np.isnan(since), -1, np.digitize(np.nan_to_num(since), SINCE_EDGES[1:-1]))
+        bins["since_rev"] = binned(vi, code, SINCE_LABELS)
+    for key in ("speed", "position", "since_rev"):
+        if key in bins:
+            splits.append(bin_split(key, bins[key]))
 
     # --- reversal-aligned velocity profiles for the plot ---
     pre, post = int(0.2 * FS), int(0.5 * FS)
@@ -208,8 +239,21 @@ def analyze(run: Run) -> dict:
                           tsp[a + j * step], proj[j]] for j in range(len(proj))]))
         return out
 
+    metrics = {
+        "on_pct": _pct(on[ok]),
+        "centred_pct": _share(bins.get("position"), "centred"),
+        "far_behind_pct": _share(bins.get("position"), "far behind"),
+        "fast_on_pct": _on_at(bins.get("speed"), SPEED_LABELS[4:]),
+        "lead_r": float(np.nanmean(along_r)) if moving.any() else float("nan"),
+        "react_ms": med("react_ms", rev_rows),
+        "recov_ms": med("recov_ms", rev_rows),
+        "off_per_min": len(off) / max(ok.sum() / FS / 60, 1e-6),
+        "off_med_ms": float(np.median(off)) if off else 0.0,
+        "off_p90_ms": float(np.percentile(off, 90)) if off else 0.0,
+    }
+
     return {
-        "mode": "tracking", "summary": summary, "columns": COLUMNS, "legend": LEGEND,
+        "mode": "tracking", "metrics": metrics, "bins": bins, "summary": summary, "columns": COLUMNS, "legend": LEGEND,
         "rows": [[r[c] for c in COLUMNS] for r in table], "splits": splits, "worst": worst,
         "on_pct": _pct(on[ok]), "lag_ms": lag_ms, "table": table,
         "plot": {"px": -ex[ok] / arad[ok], "py": -ey[ok] / arad[ok],
@@ -293,20 +337,34 @@ def _xcorr_lag(tvx, tvy, cvx, cvy, valid) -> float:
     return float((lags[i] + frac) / FS * 1000)
 
 
-def _tremor(rx, ry, valid, dt) -> tuple[float, float]:
-    """(% of 1-30 Hz error-velocity power in the 8-12 Hz band, rms error acceleration)."""
-    size = int(FS)
-    win = np.hanning(size)
-    freqs = np.fft.rfftfreq(size, dt)
-    power = np.zeros(len(freqs))
-    acc: list[np.ndarray] = []
-    for a, b in runs(valid):
-        acc.append(np.hypot(np.gradient(rx[a:b], dt), np.gradient(ry[a:b], dt)) if b - a > 2 else np.zeros(0))
-        for s in range(a, b - size + 1, size // 2):
-            for r in (rx[s:s + size], ry[s:s + size]):
-                power += np.abs(np.fft.rfft((r - r.mean()) * win)) ** 2
-    band = power[(freqs >= 8) & (freqs <= 12)].sum()
-    total = power[(freqs >= 1) & (freqs <= 30)].sum()
-    all_acc = np.concatenate(acc) if acc else np.zeros(0)
-    return (100.0 * band / total if total > 0 else float("nan"),
-            float(np.sqrt(np.mean(all_acc ** 2))) if len(all_acc) else float("nan"))
+def bin_split(key: str, rows: list) -> tuple[str, list[str], list[list]]:
+    """Report table from bin rows [label, sec, on_sec, lead_sum, lead_n] (one run or pooled)."""
+    title, head = BIN_TITLES[key]
+    total = sum(r[1] for r in rows) or 1.0
+    out = [[r[0], 100 * r[1] / total, 100 * r[2] / r[1] if r[1] else float("nan"),
+            r[3] / r[4] if r[4] else float("nan")] for r in rows if r[1] >= 0.25]
+    return title, [head, "time_pct", "on_pct", "lead_r"], out
+
+
+def pool_bins(many: list[list]) -> list:
+    """Sum bin rows from several runs (same labels, same order)."""
+    out = [list(r) for r in many[0]]
+    for rows in many[1:]:
+        for o, r in zip(out, rows):
+            for j in range(1, 5):
+                o[j] += r[j]
+    return out
+
+
+def _share(rows, label) -> float:
+    if not rows:
+        return float("nan")
+    total = sum(r[1] for r in rows)
+    return 100 * sum(r[1] for r in rows if r[0] == label) / total if total else float("nan")
+
+
+def _on_at(rows, labels) -> float:
+    if not rows:
+        return float("nan")
+    sec = sum(r[1] for r in rows if r[0] in labels)
+    return 100 * sum(r[2] for r in rows if r[0] in labels) / sec if sec >= 1.0 else float("nan")

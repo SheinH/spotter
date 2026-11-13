@@ -9,18 +9,25 @@ import numpy as np
 from .format import BTN_FIRE, Run
 from .geometry import OCTANTS, octant, smooth, target_view, view
 
-COLUMNS = ["i", "t_s", "dist_deg", "dir", "react_ms", "peak_dps", "land_r", "off_r", "corr",
-           "acq_ms", "confirm_ms", "ttk_ms", "shots", "miss", "on_pct"]
+COLUMNS = ["i", "t_s", "dist_deg", "dir", "react_ms", "peak_dps", "land_r", "off_r", "over_r",
+           "past_ms", "corr", "acq_ms", "confirm_ms", "ttk_ms", "shots", "miss", "on_pct"]
+SETTLE_MS = 50.0     # on target this long without a break = settled; later drift is tracking, not overflick
 LEGEND = (
     "One row per kill, timed from the previous kill (or the target's spawn if later). "
     "dist_deg=flick distance; dir=screen direction to the target; react_ms=start until the hand "
     "moves; peak_dps=peak crosshair speed; land_r=where the first movement ended along the flick "
     "line in target radii (- short, + past, |x|<1 on target); off_r=total distance from centre at "
-    "that moment, radii; corr=corrective movements after it; acq_ms=start until first on target; "
+    "that moment, radii; over_r=furthest past the target centre along the flick line, from peak "
+    f"speed until settled on target ({SETTLE_MS:.0f} ms on it) or the kill, radii (>1 = beyond the "
+    "far edge, 0 = never crossed the centre); past_ms=time beyond the far edge in that stretch; "
+    "corr=corrective movements after it; acq_ms=start until first on target; "
     "confirm_ms=time on target before the killing shot; miss=missed shots with type "
     "(E fired before arriving, O past the target, D was on target then left); "
     "on_pct=share of time on target after first reaching it."
 )
+
+
+DIST_BINS = [("<10 deg", 0, 10), ("10-20 deg", 10, 20), ("20-35 deg", 20, 35), (">35 deg", 35, 1e9)]
 
 
 def shot_frames(run: Run) -> np.ndarray:
@@ -134,8 +141,8 @@ def analyze(run: Run, mode: str = "clicking") -> dict:
         row = {"t_s": float(run.t[s] - run.t[0]), "dist_deg": dist, "dir": octant(ex[0], ey[0]),
                "ttk_ms": float((run.t[k] - run.t[s]) * 1000.0)}
         nan = float("nan")
-        row.update(react_ms=nan, peak_dps=nan, land_r=nan, off_r=nan, corr=0, acq_ms=nan,
-                   confirm_ms=nan, on_pct=nan)
+        row.update(react_ms=nan, peak_dps=nan, land_r=nan, off_r=nan, over_r=nan, past_ms=nan,
+                   corr=0, acq_ms=nan, confirm_ms=nan, on_pct=nan)
 
         if dist > arad[0]:
             p = int(np.argmax(sp))
@@ -149,7 +156,9 @@ def analyze(run: Run, mode: str = "clicking") -> dict:
             q = p + int(ended[0]) if len(ended) else len(sp) - 1
             row["land_r"] = float(-rem[q] / arad[q])
             row["off_r"] = float(ang[q] / arad[q])
-            row["corr"] = _count_peaks(sp[q:], tt[q:], max(0.12 * peak, 8.0))
+            row["over_r"], row["past_ms"] = _overflick(rem[p:] / arad[p:], on[p:], tt[p:])
+            # with the trigger held the hand keeps moving after the flick; bumps are tracking, not corrections
+            row["corr"] = float("nan") if continuous else _count_peaks(sp[q:], tt[q:], max(0.12 * peak, 8.0))
         if on.any():
             first_on = int(np.argmax(on))
             row["acq_ms"] = float(tt[first_on])
@@ -210,33 +219,48 @@ def analyze(run: Run, mode: str = "clicking") -> dict:
         + ("" if continuous else f", {misses} misses "
            f"({all_types.count('E')} early, {all_types.count('O')} past, {all_types.count('D')} drifted off)"),
         f"median time per kill {med('ttk_ms'):.0f} ms = reaction {med('react_ms'):.0f} "
-        f"+ travel to first on-target at {med('acq_ms'):.0f} ms, confirm {med('confirm_ms'):.0f} ms before the shot",
-        f"flicks: median distance {med('dist_deg'):.1f} deg, peak speed {med('peak_dps'):.0f} deg/s, "
-        f"{np.mean(col('corr')):.2f} corrections per kill",
+        f"+ travel to first on-target at {med('acq_ms'):.0f} ms, "
+        + (f"then {med('confirm_ms'):.0f} ms on the target until it died" if continuous
+           else f"confirm {med('confirm_ms'):.0f} ms before the shot"),
+        f"flicks: median distance {med('dist_deg'):.1f} deg, peak speed {med('peak_dps'):.0f} deg/s"
+        + ("" if continuous else f", {np.mean(col('corr')):.2f} corrections per kill"),
     ]
     if len(land):
         summary.append(
             f"first movement lands short on {100 * np.mean(land < -1):.0f}%, on target on "
             f"{100 * np.mean(np.abs(land) <= 1):.0f}%, past on {100 * np.mean(land > 1):.0f}% "
             f"(median {np.median(land):+.2f} radii)")
+    over = col("over_r")
+    if len(over):
+        big = [r for r in table if r["over_r"] > 1.0]
+        summary.append(
+            f"overflick (went beyond the far edge before settling) on {100 * np.mean(over > 1):.0f}% of flicks"
+            + (f"; on those, median {med('over_r', big):.2f} radii past centre for {med('past_ms', big):.0f} ms"
+               if big else ""))
     if continuous:
         summary.append(f"after first reaching a target, on it {med('on_pct'):.0f}% of the time until it dies")
 
     # --- splits ---
-    head = ["n", "ttk_ms", "react_ms", "land_r", "corr", "confirm_ms", "misses"]
+    head = ["n", "ttk_ms", "react_ms", "land_r", "over_pct", "past_ms", "corr", "confirm_ms", "misses"]
+
+    def over_pct(rows):
+        v = col("over_r", rows)
+        return 100 * float(np.mean(v > 1)) if len(v) else float("nan")
 
     def agg(rows):
+        big = [r for r in rows if r["over_r"] > 1.0]
         return [len(rows), med("ttk_ms", rows), med("react_ms", rows), med("land_r", rows),
-                float(np.mean(col("corr", rows))) if rows else float("nan"),
+                over_pct(rows), med("past_ms", big) if big else float("nan"),
+                float(np.mean(col("corr", rows))) if len(col("corr", rows)) else float("nan"),
                 med("confirm_ms", rows), sum(r["_miss_n"] for r in rows)]
 
     splits = []
     dists = np.array([r["dist_deg"] for r in table])
     if len(table) >= 9:
-        q = np.quantile(dists, [1 / 3, 2 / 3])
-        buckets = [(f"<{q[0]:.0f} deg", dists < q[0]), (f"{q[0]:.0f}-{q[1]:.0f} deg", (dists >= q[0]) & (dists < q[1])),
-                   (f">{q[1]:.0f} deg", dists >= q[1])]
-        splits.append(("By flick distance", ["dist"] + head,
+        # fixed edges, the same in every run, so runs can be compared and pooled
+        buckets = [(lab, (dists >= lo) & (dists < hi)) for lab, lo, hi in DIST_BINS]
+        buckets = [(lab, m) for lab, m in buckets if m.any()]
+        splits.append(("By flick distance (fixed bands)", ["dist"] + head,
                        [[name] + agg([r for r, m in zip(table, mask) if m]) for name, mask in buckets]))
     else:
         buckets = [("all", np.ones(len(table), dtype=bool))]
@@ -259,14 +283,49 @@ def analyze(run: Run, mode: str = "clicking") -> dict:
                          for j in range(0, len(tr["tt"]), step)]))
         return out
 
+    metrics = {
+        "kills_per_min": 60 * len(table) / dur,
+        "ttk_ms": med("ttk_ms"), "react_ms": med("react_ms"), "acq_ms": med("acq_ms"),
+        "peak_dps": med("peak_dps"), "over_pct": over_pct(table),
+    }
+    if continuous:
+        metrics["on_pct"] = med("on_pct")
+    else:
+        metrics.update(confirm_ms=med("confirm_ms"), land_r=med("land_r"),
+                       short_pct=100 * float(np.mean(land < -1)) if len(land) else float("nan"),
+                       corr=float(np.mean(col("corr"))) if len(col("corr")) else float("nan"),
+                       miss_per_kill=misses / max(len(table), 1))
+
     return {
-        "mode": mode, "summary": summary, "columns": COLUMNS, "legend": LEGEND,
+        "mode": mode, "metrics": metrics, "bins": {}, "summary": summary, "columns": COLUMNS, "legend": LEGEND,
         "rows": [[r[c] for c in COLUMNS] for r in table], "splits": splits, "worst": worst,
         "table": table, "kills": len(table), "shots": len(shots), "misses": misses,
         "kill_times": np.array([run.t[k] for k, _tid, _f0 in kill_list]),
         "plot": {"scatter": scat, "traces": traces, "dists": dists,
                  "buckets": [(name, np.flatnonzero(mask)) for name, mask in buckets]},
     }
+
+
+def _overflick(rem_r: np.ndarray, on: np.ndarray, tt: np.ndarray) -> tuple[float, float]:
+    """From peak flick speed onward: (furthest past the target centre along the flick line in
+    radii, floored at 0; ms spent beyond the far edge). Stops once the crosshair has stayed on
+    the target for SETTLE_MS, so passing straight through the target still counts."""
+    end = len(on)
+    i = 0
+    while i < len(on):
+        if on[i]:
+            j = i
+            while j < len(on) and on[j]:
+                j += 1
+            if tt[j - 1] - tt[i] >= SETTLE_MS:
+                end = i + 1 + int(np.searchsorted(tt[i:j], tt[i] + SETTLE_MS))
+                break
+            i = j
+        else:
+            i += 1
+    past = -rem_r[:end]
+    dt = np.diff(tt[:end], append=tt[end - 1] if end else 0.0)
+    return float(max(past.max(), 0.0)) if end else 0.0, float(dt[past > 1.0].sum())
 
 
 def _count_peaks(sp: np.ndarray, tt: np.ndarray, threshold: float) -> int:

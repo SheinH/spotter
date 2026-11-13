@@ -3,7 +3,11 @@ name = "spotter-analyze"
 version = "0.1.0"
 description = "Reduce Spotter .spot telemetry from KovaaK's into coach-readable reports"
 requires-python = ">=3.11"
-dependencies = ["numpy", "matplotlib"]
+dependencies = [
+    "numpy",
+ "matplotlib",
+ "scipy>=1.17.1",
+]
 
 [dependency-groups]
 dev = ["pytest"]

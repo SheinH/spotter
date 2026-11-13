@@ -42,7 +42,13 @@ def header(name: str, result: dict, stats: Stats | None, run) -> list[str]:
             lines.append(f"paused {f['Pause Count']}x for {f.get('Pause Duration', '?')}s during the run; "
                          "the pause is inside the analyzed window")
     else:
-        lines.append("no KovaaK's stats file matched; whole log analyzed")
+        lines.append("no KovaaK's stats file for this stretch (restarted before the end, free play, or not "
+                     "KovaaK's): run boundaries come from the log, scenario and settings unknown")
+    if stats:
+        want = (stats.end - stats.start).total_seconds()
+        got = run.t[-1] - run.t[0]
+        if want > 0 and got < 0.95 * want:
+            lines.append(f"the log only covers {got:.0f}s of this {want:.0f}s run (hook started or stopped mid-run)")
     dts = np.diff(run.t)
     lines.append(f"log: {run.t[-1] - run.t[0]:.1f}s, {len(run.t)} frames, median {1 / np.median(dts):.0f} Hz")
     return lines
@@ -69,15 +75,33 @@ def crosscheck(result: dict, stats: Stats | None, wall0: float = 0.0) -> list[st
     return out
 
 
-def write(out_dir: Path, name: str, result: dict, stats: Stats | None, run, worst: int = 0) -> Path:
+def write(out_dir: Path, name: str, result: dict, stats: Stats | None, run, worst: int = 0,
+          tension: dict | None = None, noise: tuple | None = None, context: list[str] | None = None) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     lines = header(name, result, stats, run)
-    lines += ["", "## Summary", ""] + [f"- {s}" for s in result["summary"]]
+    lines += ["", "## Summary", ""] + [f"- {s}" for s in (context or []) + result["summary"]]
+    if noise:
+        columns, rows, n = noise
+        lines += ["", "## Against your other runs of this scenario (noise layer)", ""]
+        if n < 3:
+            lines.append(f"Only {n} other analyzed run(s) of this scenario so far; the spread needs at least 3. "
+                         "Until then treat every difference of a few points as noise.")
+        lines.append("usual/sd = mean and spread of your last runs (score: from KovaaK's own files). "
+                     "noise_2runs = how far two single runs must differ before it means anything. "
+                     "\"within noise\" = this run is an ordinary draw from your usual spread; don't read into it.")
+        if n < 3:
+            rows = [r for r in rows if r[4] >= 3]
+        if rows:
+            lines += ["", "```tsv", tsv(columns, rows), "```"]
     checks = crosscheck(result, stats, run.start_wall_us / 1e6)
     if checks:
         lines += ["", "## Cross-check against the game's own files", ""] + [f"- {c}" for c in checks]
     for title, columns, rows in result["splits"]:
         lines += ["", f"## {title}", "", "```tsv", tsv(columns, rows), "```"]
+    if tension and tension["summary"]:
+        lines += ["", "## Tension (jitter and braking)", ""] + [f"- {s}" for s in tension["summary"]]
+        for title, columns, rows in tension["splits"]:
+            lines += ["", f"### {title}", "", "```tsv", tsv(columns, rows), "```"]
     lines += ["", "## Events", "", result["legend"], "", "```tsv", tsv(result["columns"], result["rows"]), "```"]
     if worst:
         lines += ["", f"## Worst {worst} events, raw traces", ""]
