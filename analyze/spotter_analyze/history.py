@@ -31,7 +31,8 @@ LABELS = {
     "off_per_min": ("off-target episodes per min", None),
     "off_med_ms": ("median off-target stretch ms", False),
     "off_p90_ms": ("long off-target stretches (90th pct) ms", False),
-    "jitter": ("tension jitter", False),
+    "hold_jitter": ("on-target jitter (not yet validated)", None),
+    "activity": ("hand activity 6-13 Hz (context)", None),
     "kills_per_min": ("kills per min", True),
     "ttk_ms": ("time per kill ms", False),
     "acq_ms": ("time to first on target ms", False),
@@ -40,8 +41,16 @@ LABELS = {
     "land_r": ("first flick lands, radii (- short)", None),
     "short_pct": ("first flick short %", False),
     "over_pct": ("overflick (past far edge) %", False),
+    "slip_pct": ("kills with a slip off target %", False),
     "corr": ("corrections per kill", False),
     "miss_per_kill": ("misses per kill", False),
+    "flick_gain": ("flick gain (reach / distance, 1 = exact)", None),
+    "flick_spread_pct": ("flick scatter, % of distance", False),
+    "off_after_pct": ("time off target after first contact %", False),
+    "nearest_pct": ("went to the nearest target %", None),
+    "extra_deg": ("extra flick distance vs nearest target, deg", None),
+    "shift_on_pct": ("on target % with delay removed (ceiling)", True),
+    "shift_gain_pts": ("on-target points lost to delay", False),
 }
 
 
@@ -56,8 +65,10 @@ def _num(x):
 def make_record(name: str, mode: str, stats: kovaaks.Stats | None, result: dict, tension: dict | None) -> dict:
     f = stats.fields if stats else {}
     metrics = dict(result.get("metrics", {}))
-    if tension and "jitter" in tension:
-        metrics["jitter"] = tension["jitter"]
+    if tension:
+        for key in ("hold_jitter", "activity"):
+            if _num(tension.get(key)) is not None:
+                metrics[key] = tension[key]
     return {
         "name": name,
         "scenario": stats.scenario if stats else None,

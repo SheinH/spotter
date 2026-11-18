@@ -68,11 +68,33 @@ def crosscheck(result: dict, stats: Stats | None, wall0: float = 0.0) -> list[st
                    f"shots: log {result['shots']} vs game {stats.shots}")
         if stats.kill_times and len(result["kill_times"]):
             game = np.array([k.timestamp() for k in stats.kill_times])
-            mine = result["kill_times"] + wall0
-            delta = np.array([mine[np.argmin(np.abs(mine - g))] - g for g in game]) * 1000
-            out.append(f"{int((np.abs(delta) < 15).sum())} of {len(game)} game kills have a log kill within 15 ms "
-                       f"(median offset {np.median(delta):+.1f} ms)")
+            mine = np.sort(result["kill_times"] + wall0)
+            shift, matched = align_kills(mine, game)
+            out.append(f"{matched} of {len(game)} game kills line up with a log kill within 15 ms once the two "
+                       f"clocks are aligned (log clock {shift:+.0f} ms against the game's: a clock difference "
+                       f"that drifts between runs, not a timing error)")
     return out
+
+
+def align_kills(mine: np.ndarray, game: np.ndarray, tol: float = 0.015, span: float = 2.0) -> tuple[float, int]:
+    """Offset (ms, log minus game) that lines up the most kills, and how many line up within `tol` s.
+    The log's clock (QPC from injection) and KovaaK's wall-clock timestamps drift apart by up to a few
+    hundred ms over a sitting. Kills come ~0.5 s apart, so matching each game kill to its nearest log
+    kill without removing that offset pairs many with the neighbouring kill instead."""
+    def nearest(shift):
+        x = mine - shift
+        if len(x) == 1:
+            return x[0] - game
+        i = np.clip(np.searchsorted(x, game), 1, len(x) - 1)
+        lo, hi = x[i - 1] - game, x[i] - game
+        return np.where(np.abs(lo) < np.abs(hi), lo, hi)
+
+    shifts = np.arange(-span, span + 1e-9, 0.001)
+    counts = [int((np.abs(nearest(s)) < tol).sum()) for s in shifts]
+    coarse = float(shifts[int(np.argmax(counts))])
+    d = nearest(coarse)
+    fine = coarse + float(np.median(d[np.abs(d) < tol]))
+    return fine * 1000.0, int((np.abs(nearest(fine)) < tol).sum())
 
 
 def write(out_dir: Path, name: str, result: dict, stats: Stats | None, run, worst: int = 0,

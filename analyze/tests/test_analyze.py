@@ -65,9 +65,30 @@ def test_tension_recovers_planted_tremor():
     base = 2 * math.pi * 10 * 0.05 / math.sqrt(2)
     assert shaky["thirds"][0] == pytest.approx(base * 7 / 6, rel=0.15)
     assert shaky["thirds"][2] == pytest.approx(base * 11 / 6, rel=0.15)
-    assert calm["jitter"] < 0.25 * shaky["jitter"]
-    assert shaky["peak_hz"] == pytest.approx(10, abs=1)
-    assert shaky["excess_db"] > calm["excess_db"] + 5
+    assert calm["activity"] < 0.25 * shaky["activity"]
+    # on-target jitter sees the tremor too, and the tremor peak test finds it at 10 Hz
+    # (calm still has synth's 0.02 deg per-frame noise, which reads ~0.85 deg/s)
+    assert calm["hold_jitter"] < 0.4 * shaky["hold_jitter"]
+    assert shaky["tremor"]["peak_hz"] == pytest.approx(10, abs=1)
+    assert shaky["tremor"]["peak_db"] > 3
+
+
+def test_hold_jitter_ignores_flicks_and_finds_tremor():
+    def hold(**kw):
+        return tension.hold_jitter(synth.clicking(kills=60, early_every=0, confirm=0.19, **kw), "switching")
+    calm, shaky = hold(), hold(tremor_deg=0.05)
+    planted = 2 * math.pi * 10 * 0.05 / math.sqrt(2)
+    assert calm["value"] < 0.05                     # flicks and corrections don't leak in
+    assert shaky["value"] == pytest.approx(planted, rel=0.35)   # trend removal costs some of it
+    lo, hi = shaky["range90"]
+    assert lo <= shaky["value"] <= hi
+
+
+def test_hold_jitter_does_not_grow_with_flick_size():
+    small = tension.hold_jitter(synth.clicking(kills=60, early_every=0, confirm=0.19, tremor_deg=0.03), "switching")
+    big = tension.hold_jitter(synth.clicking(kills=60, early_every=0, confirm=0.19, tremor_deg=0.03,
+                                             reach=0.6), "switching")      # bigger corrections
+    assert big["value"] == pytest.approx(small["value"], rel=0.2)
 
 
 def test_tension_flags_flick_rebound():
@@ -129,6 +150,95 @@ def test_overflick_counts_pass_through_but_not_later_drift():
     # settled on target first, then drifted past: tracking error, not overflick
     rem2 = np.where(tt < 200, 0.0, -3.0)
     assert clicking._overflick(rem2, np.abs(rem2) <= 1, tt) == (0.0, 0.0)
+
+
+def test_off_episodes_after_settling():
+    tt = np.arange(0, 600, 2.5)                      # 400 Hz, ms
+    miss_r = np.full(len(tt), 0.5)                   # on target (inside the edge)
+    miss_r[tt < 100] = 3.0                           # flying in
+    miss_r[(tt >= 105) & (tt < 115)] = 2.0           # pass-through bounce before settling: not counted
+    miss_r[(tt >= 250) & (tt < 255)] = 1.02          # 2-frame graze: an episode, but under SLIP_MS
+    miss_r[(tt >= 350) & (tt < 450)] = 1.6           # a real slip, 100 ms
+    miss_r[tt >= 590] = 4.0                          # leaving as it dies: not counted
+    eps = clicking._off_episodes(miss_r <= 1, miss_r, tt)
+    assert len(eps) == 2
+    assert eps[0][0] < clicking.SLIP_MS
+    assert eps[1][0] == pytest.approx(102.5, abs=3)
+    assert eps[1][1] == pytest.approx(0.6)
+
+
+@pytest.mark.parametrize("reach", [0.85, 1.2])
+def test_flick_gain_recovers_planted_reach(reach):
+    res = clicking.analyze(synth.clicking(kills=40, reach=reach, early_every=0))
+    fg = clicking.flick_gain(res["table"])
+    # the first movement is cut where speed falls to 25% of peak: ~97.5% of a minimum-jerk path
+    assert fg["gain"] == pytest.approx(0.975 * reach, abs=0.04)
+    assert fg["slope"] == pytest.approx(0.975 * reach, abs=0.06)
+    assert abs(fg["offset_deg"]) < 1.0
+    assert fg["spread_pct"] < 5 and fg["side_deg"] < 0.3
+    assert res["metrics"]["flick_gain"] == fg["gain"]
+
+
+def test_time_budget_adds_up():
+    res = clicking.analyze(synth.clicking(kills=40, react=0.18, reach=0.85, early_every=0), "switching")
+    for r in res["table"]:
+        assert sum(r["_budget"].values()) == pytest.approx(r["ttk_ms"], abs=0.5)
+    assert np.median([r["_budget"]["react"] for r in res["table"]]) == pytest.approx(180, abs=25)
+    assert all(r["_budget"]["slip"] == 0 for r in res["table"])
+    cols, rows, share = clicking.time_budget(res["table"], True)
+    assert sum(v[0] for v in share.values()) == pytest.approx(100, abs=0.5)
+    assert math.isnan(rows[-1][5])          # on-target time can't be cut in switching
+    assert any("time budget" in s for s in res["summary"])
+
+
+@pytest.mark.parametrize("lag", [0.08, 0.15])
+def test_lag_shift_recovers_planted_delay(lag):
+    # small target, so a pure delay pushes the crosshair off it; shifting it back fixes everything
+    res = tracking.analyze(synth.tracking(lag=lag, speed=40.0, radius=25.0))
+    m = res["metrics"]
+    assert m["shift_on_pct"] > 95
+    assert m["shift_gain_pts"] > 20
+    line = [s for s in res["summary"] if s.startswith("lag-shift")][0]
+    assert float(line.split("crosshair ")[1].split(" ms")[0]) == pytest.approx(lag * 1000, abs=12)
+
+
+def test_clean_switching_run_has_no_slips():
+    res = clicking.analyze(synth.clicking(kills=20, reach=0.85, early_every=0), "switching")
+    assert all(r["slips"] == 0 for r in res["table"])
+    assert res["metrics"]["slip_pct"] == 0
+
+
+def _with_decoy(run, angles):
+    """`run` plus one target that never dies, at yaw/pitch `angles` (one row per frame)."""
+    from dataclasses import replace
+    n = len(run.t)
+    order = np.argsort(np.r_[run.tgt_frame, np.arange(n)], kind="stable")
+    cat = lambda a, b: np.concatenate([a, b])[order]
+    return replace(
+        run, tgt_frame=cat(run.tgt_frame, np.arange(n)), tgt_id=cat(run.tgt_id, np.full(n, 9999)),
+        tgt_pos=cat(run.tgt_pos, synth.DIST * synth._direction(angles[:, 0], angles[:, 1])),
+        tgt_radius=cat(run.tgt_radius, np.full(n, 25.0)), tgt_hh=cat(run.tgt_hh, np.full(n, 25.0)),
+        tgt_health=cat(run.tgt_health, np.ones(n)))
+
+
+def test_target_choice_ranks_the_picked_target():
+    run = synth.clicking(kills=20, early_every=0)
+    n = len(run.t)
+    alone = clicking.analyze(run)
+    assert "nearest_pct" not in alone["metrics"]      # one target: nothing to choose
+    assert "pick" not in alone["columns"]
+
+    far = clicking.analyze(_with_decoy(run, np.tile([120.0, 0.0], (n, 1))))
+    assert far["metrics"]["nearest_pct"] == 100
+    assert far["metrics"]["extra_deg"] == 0
+    assert far["columns"][-3:] == ["opts", "pick", "extra_deg"]
+
+    # a decoy that rides 3 deg from the crosshair is always the nearer one (targets spawn 12+ away)
+    near = clicking.analyze(_with_decoy(run, np.c_[run.yaw + 3.0, run.pitch]))
+    assert near["metrics"]["nearest_pct"] == 0
+    assert all(r["pick"] == 2 and r["opts"] == 2 for r in near["table"])
+    assert all(r["extra_deg"] == pytest.approx(r["dist_deg"] - 3.0, abs=0.3) for r in near["table"])
+    assert any(line.startswith("target choice") for line in near["summary"])
 
 
 CSV = """Kill #,Timestamp,Bot,Weapon,TTK,Shots,Hits,Accuracy,Damage Done,Damage Possible,Efficiency,Cheated,OverShots
@@ -236,3 +346,14 @@ def test_session_page(tmp_path):
     text = session.write(tmp_path / "s", "Synth", recs, tmp_path / "none").read_text(encoding="utf-8")
     assert "## Pooled across runs" in text and "## Trend" in text and "What moves with score" in text
     assert "far behind" in text and "100-200" in text
+
+
+def test_align_kills_recovers_clock_offset_between_close_kills():
+    # kills ~0.5 s apart with the log clock 247 ms behind: half way to the next kill, so plain
+    # nearest-neighbour matching would pair many game kills with the wrong log kill
+    rng = np.random.default_rng(3)
+    game = 1000.0 + np.cumsum(rng.uniform(0.35, 0.75, 100))
+    mine = np.sort(game - 0.247 + rng.normal(0, 0.002, len(game)))
+    shift, matched = report.align_kills(mine, game)
+    assert shift == pytest.approx(-247, abs=3)
+    assert matched >= 98

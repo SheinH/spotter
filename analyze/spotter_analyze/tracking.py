@@ -145,6 +145,10 @@ def analyze(run: Run) -> dict:
 
     # --- whole-run numbers ---
     lag_ms = _xcorr_lag(tvx, tvy, cvx, cvy, valid) if moving.sum() > 0.2 * max(valid.sum(), 1) else float("nan")
+    # Tall bots: half-length of the capsule's spine as seen, so the shifted on-target test matches `on`.
+    tdist = np.maximum(np.linalg.norm(run.tgt_pos[rows] - run.cam[run.tgt_frame[rows]], axis=1), 1e-6)
+    spine = ip(np.degrees(np.arctan(np.maximum(run.tgt_hh[rows] - run.tgt_radius[rows], 0) / tdist)))
+    shift = _shift_curve(yaw, pitch, ex, ey, arad, spine, valid, tidu)
     off = [(b - a) / FS * 1000 for a, b in runs(ok & ~on)]
     rev_rows = [r for r in table if r["rev"]]
 
@@ -165,6 +169,11 @@ def analyze(run: Run) -> dict:
         f"off-target episodes {len(off)}, median {np.median(off) if off else 0:.0f} ms, "
         f"longest {max(off) if off else 0:.0f} ms",
     ]
+    if shift:
+        summary.append(
+            f"lag-shift ceiling: on target {shift['base']:.1f}% as played; replaying your crosshair "
+            f"{shift['best_ms']:.0f} ms earlier gives {shift['best']:.1f}% (+{shift['best'] - shift['base']:.1f} points "
+            f"from timing alone); the {100 - shift['best']:.1f}% still off is imprecision, not delay")
 
     # --- splits ---
     splits: list[tuple[str, list[str], list[list]]] = []
@@ -211,6 +220,10 @@ def analyze(run: Run) -> dict:
     for key in ("speed", "position", "since_rev"):
         if key in bins:
             splits.append(bin_split(key, bins[key]))
+    if shift:
+        splits.append(("Lag-shift: on target if your crosshair had moved this much earlier (same path, "
+                       "shifted in time)", ["earlier_ms", "on_pct", "gain_pts"],
+                       [[ms, p, p - shift["base"]] for ms, p in zip(shift["ms"], shift["on"]) if ms % 20 == 0]))
 
     # --- reversal-aligned velocity profiles for the plot ---
     pre, post = int(0.2 * FS), int(0.5 * FS)
@@ -250,6 +263,8 @@ def analyze(run: Run) -> dict:
         "off_per_min": len(off) / max(ok.sum() / FS / 60, 1e-6),
         "off_med_ms": float(np.median(off)) if off else 0.0,
         "off_p90_ms": float(np.percentile(off, 90)) if off else 0.0,
+        "shift_on_pct": shift["best"] if shift else float("nan"),
+        "shift_gain_pts": shift["best"] - shift["base"] if shift else float("nan"),
     }
 
     return {
@@ -313,6 +328,38 @@ def _segment(a, b, axis, tu, tvx, tvy, tsp, cvx, cvy, ex, ey, arad, on, along_r,
     elif back is not None:
         row["recov_ms"] = (pk + back) / FS * 1000
     return row
+
+
+SHIFT_MAX_MS = 200
+
+
+def _shift_curve(yaw, pitch, ex, ey, arad, spine, valid, tidu) -> dict | None:
+    """On-target % if the crosshair were where it actually was `s` ms later, for s = 0..SHIFT_MAX_MS.
+    The best value is what fixing delay alone would buy; the rest of the gap to 100% is imprecision.
+    Small-angle: the error moves by the crosshair's own yaw/pitch change over s. Every shift is scored
+    on the same frames (valid now and SHIFT_MAX_MS later, same target), so the curve is comparable."""
+    n = len(yaw)
+    smax = int(round(SHIFT_MAX_MS / 1000 * FS))
+    if n <= smax + 100:
+        return None
+    base = np.arange(n - smax)
+    use = valid[base] & valid[base + smax] & (tidu[base] == tidu[base + smax])
+    idx = base[use]
+    if len(idx) < 0.5 * FS:
+        return None
+    cosp = np.cos(np.radians(pitch[idx]))
+    step = max(1, int(round(0.004 * FS)))          # every 4 ms
+    ms, on = [], []
+    for s in range(0, smax + 1, step):
+        dx = ex[idx] - (yaw[idx + s] - yaw[idx]) * cosp
+        dy = ey[idx] - (pitch[idx + s] - pitch[idx])
+        miss = np.hypot(dx, np.maximum(np.abs(dy) - spine[idx], 0))
+        ms.append(s / FS * 1000)
+        on.append(100.0 * float((miss <= arad[idx]).mean()))
+    best = max(on)
+    # A big target is hit over a range of shifts; take the middle of the top of the curve.
+    best_ms = float(np.median([m for m, p in zip(ms, on) if p >= best - 0.25]))
+    return {"ms": [round(m) for m in ms], "on": on, "base": on[0], "best": best, "best_ms": best_ms}
 
 
 def _xcorr_lag(tvx, tvy, cvx, cvy, valid) -> float:

@@ -73,12 +73,15 @@ def _min_jerk(u):
 
 def clicking(seed: int = 0, kills: int = 40, fps: float = 360.0, react: float = 0.18,
              reach: float = 0.85, radius: float = 25.0, early_every: int = 5,
-             lockout_deg: float = 0.0) -> Run:
+             lockout_deg: float = 0.0, confirm: float = 0.05, tremor_deg: float = 0.0,
+             tremor_hz: float = 10.0) -> Run:
     """One static target at a time. Each kill: wait `react`, flick `reach` of the way
     (0.85 = 15% short), pause, correct onto the centre, confirm 50 ms, shoot.
     Every `early_every`-th kill also fires once at the end of the short first flick.
     `lockout_deg`: after each flick stops, a 10 Hz shake that decays over ~80 ms, with this
-    amplitude per 30 deg of flick (bigger flicks, bigger shake)."""
+    amplitude per 30 deg of flick (bigger flicks, bigger shake).
+    `confirm`: seconds on the target before the shot. `tremor_deg`: a steady `tremor_hz`
+    shake of this amplitude on top of everything, the whole run."""
     rng = np.random.default_rng(seed)
     dt = 1.0 / fps
     cur = np.array([0.0, 0.0])        # crosshair yaw, pitch
@@ -117,7 +120,7 @@ def clicking(seed: int = 0, kills: int = 40, fps: float = 360.0, react: float = 
         steps = int(0.08 * fps)
         for i in range(1, steps + 1):
             emit(landing + _min_jerk(i / steps) * (tgt - landing), target)
-        for _ in range(int(0.05 * fps)):
+        for _ in range(int(confirm * fps)):
             emit(tgt, target)
         cur = tgt
         # The killing frame: shot counter ticks and the target is already gone;
@@ -133,6 +136,10 @@ def clicking(seed: int = 0, kills: int = 40, fps: float = 360.0, react: float = 
             m = (u > 0) & (u < 0.4)
             shake[m] += lockout_deg * dist / 30 * np.exp(-u[m] / 0.08) * np.sin(2 * np.pi * 10 * u[m])
         YAW = list(np.array(YAW) + shake)
+    if tremor_deg:
+        tt = np.array(T)
+        phase = 2 * np.pi * tremor_hz * tt + np.cumsum(0.05 * rng.standard_normal(n))
+        PITCH = list(np.array(PITCH) + tremor_deg * np.sin(phase))
     rows = [(i, tg[0], tg[1]) for i, tg in enumerate(TGT) if tg is not None]
     angles = np.array([r[2] for r in rows])
     return Run(
