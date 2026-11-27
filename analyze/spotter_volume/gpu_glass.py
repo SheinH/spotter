@@ -1,4 +1,4 @@
-"""Liquid Glass on the GPU: the maths of glass.py (refraction maps, frost, saturation, tint,
+"""Liquid Glass on the GPU: the maths of glass.py (refraction maps, frost, colour curves,
 rim light, Fresnel) as three OpenGL passes.
 
     backdrop --blur x--> --blur y--> frost   (only when the backdrop changes)
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .glass import GlassMaps, GlassParams
+from .glass import GlassMaps, GlassParams, color_curves
 
 _VERT = """
 #version 330
@@ -52,9 +52,8 @@ uniform vec2 bsize;          // backdrop size
 uniform vec2 offset;         // card's top-left inside the backdrop
 uniform float amount;        // 0 = not materialized yet, 1 = full glass
 uniform float chroma;
-uniform float saturation;
-uniform vec3 tint;
-uniform float tint_alpha;
+uniform float luma_k[9];      // luma curve, knots at L = 0, 1/8 .. 1
+uniform float chroma_k[9];    // chroma gain, same knots
 uniform float specular;
 uniform float fresnel;
 out vec4 color;
@@ -62,6 +61,12 @@ out vec4 color;
 vec3 pick(vec2 at) {
     vec2 uv = (at + 0.5) / bsize;
     return mix(texture(sharp, uv).rgb, texture(frost, uv).rgb, amount);
+}
+
+float curve(float k[9], float x) {
+    float t = clamp(x, 0.0, 1.0) * 8.0;
+    int i = min(int(t), 7);
+    return mix(k[i], k[i + 1], t - float(i));
 }
 
 void main() {
@@ -74,8 +79,8 @@ void main() {
                   pick(at + shift).g,
                   pick(at + shift * (1.0 - chroma)).b);
     float luma = dot(c, vec3(0.2126, 0.7152, 0.0722));
-    c = clamp(vec3(luma) + (c - vec3(luma)) * mix(1.0, saturation, amount), 0.0, 1.0);
-    c = mix(c, tint, tint_alpha * amount);
+    vec3 g = clamp(vec3(curve(luma_k, luma)) + (c - vec3(luma)) * curve(chroma_k, luma), 0.0, 1.0);
+    c = mix(c, g, amount);
     float light = (m.w * fresnel + m.z * specular) * amount;
     c = c + (1.0 - c) * light;           // screen-blend white
     color = vec4(c * a, a);
@@ -140,8 +145,9 @@ class GpuGlass:
             self._vao_blur.render(vertices=3)
         self.renders += 1
 
-    def compose(self, amount: float, tint: tuple[float, float, float], tint_alpha: float) -> np.ndarray:
-        """(h, w, 4) uint8 premultiplied RGBA of the card (Qt Format_RGBA8888_Premultiplied)."""
+    def compose(self, amount: float, light: float, adapt: float = 0.5) -> np.ndarray:
+        """light: appearance, 0 = dark glass .. 1 = light glass; adapt: mean luma 0..1 of the
+        backdrop behind the card. (h, w, 4) uint8 premultiplied RGBA of the card (Qt Format_RGBA8888_Premultiplied)."""
         if self._bsize is None:
             raise RuntimeError("set_backdrop first")
         c = self._comp
@@ -154,9 +160,9 @@ class GpuGlass:
         c["offset"].value = self._offset
         c["amount"].value = float(amount)
         c["chroma"].value = self.p.chroma
-        c["saturation"].value = self.p.saturation
-        c["tint"].value = tuple(float(v) for v in tint)
-        c["tint_alpha"].value = float(tint_alpha)
+        luma_k, chroma_k = color_curves(light, adapt, self.p)
+        c["luma_k"].value = luma_k
+        c["chroma_k"].value = chroma_k
         c["specular"].value = self.p.specular
         c["fresnel"].value = self.p.fresnel
         self._vao_comp.render(vertices=3)

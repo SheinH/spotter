@@ -268,7 +268,7 @@ def test_rim_pixels_sample_from_further_inside():
     # left edge, middle row: convex glass looks inward, i.e. to the right
     assert m.sx[60, 3] > 1.0 and abs(m.sy[60, 3]) < 0.5
     assert m.sx[60, 100] == 0 and m.sy[60, 100] == 0         # flat centre: straight through
-    assert m.rim[2, 190] > m.rim[117, 10]                    # lit corner (up-right) brighter
+    assert m.rim[1, 100] > m.rim[118, 100]                   # lit (top) border brighter
 
 
 def _gpu_or_skip():
@@ -279,35 +279,45 @@ def _gpu_or_skip():
         pytest.skip(f"no GPU context: {e}")
 
 
-def test_gpu_glass_center_is_tinted_frost_and_the_lit_rim_is_brighter():
+def test_gpu_glass_center_follows_the_measured_curves():
     _gpu_or_skip()
-    from spotter_volume.glass import GlassParams, build_maps, looks_blank
+    from spotter_volume.glass import GlassParams, build_maps, color_curves, looks_blank
     from spotter_volume.gpu_glass import GpuGlass
-    m = build_maps(_rect_alpha(), 1.0)
     p = GlassParams()
+    m = build_maps(_rect_alpha(), 1.0, p)
     g = GpuGlass(m, 1.0, p)
-    bg = np.full((200, 280, 3), 100, np.uint8)           # card (120x200) with a 40 px margin
-    g.set_backdrop(bg, (40, 40))
-    tint, ta = (0.0, 0.0, 0.0), 0.5
-    out = g.compose(1.0, tint, ta)
+
+    def centre(level: int, light: float, amount: float = 1.0) -> int:
+        g.set_backdrop(np.full((200, 280, 3), level, np.uint8), (40, 40))   # 40 px margin
+        return int(g.compose(amount, light, level / 255)[60, 100, 0])
+
+    # flat centre of a flat grey: the luma curve at that grey, nothing else
+    luma, _ = color_curves(0.0, 100 / 255, p)
+    t = 100 / 255 * 8
+    assert abs(centre(100, 0.0) - round(255 * (luma[int(t)] + (luma[int(t) + 1] - luma[int(t)]) * (t % 1)))) <= 1
+    # what makes it legible: dark glass keeps white under ~half, light glass lifts black over half
+    assert centre(255, 0.0) < 135 and centre(0, 1.0) > 120
+    # not materialized yet: the backdrop shows straight through
+    assert abs(centre(100, 0.0, amount=0.0) - 100) <= 1
+    out = g.compose(1.0, 0.0, 0.4)
     assert out.shape == (120, 200, 4) and out[60, 100, 3] == 255
-    # flat centre of a flat backdrop: just the frost (= 100) under the tint
-    assert abs(int(out[60, 100, 0]) - round(100 * (1 - ta))) <= 1
-    assert out[3, 190, :3].mean() > out[116, 10, :3].mean()      # light from up-right
-    # not materialized yet: the backdrop shows straight through, untinted
-    assert abs(int(g.compose(0.0, tint, ta)[60, 100, 0]) - 100) <= 1
-    assert looks_blank(np.zeros((120, 200, 3), np.uint8)) and not looks_blank(bg)
+    assert looks_blank(np.zeros((120, 200, 3), np.uint8))
     g.release()
 
 
-def test_appearance_flips_with_hysteresis_and_tint_tracks_legibility():
-    from spotter_volume.glass import Appearance, legibility_tint
+def test_appearance_flips_with_hysteresis():
+    from spotter_volume.glass import Appearance
     a = Appearance()
     assert [a.update(x) for x in (0.3, 0.6, 0.7, 0.55, 0.5, 0.4)] == \
         [False, False, True, True, True, False]
-    # white text needs more tint over a bright backdrop; dark text over a dark one
-    assert legibility_tint(0.8, 0.0) > legibility_tint(0.1, 0.0)
-    assert legibility_tint(0.1, 1.0) > legibility_tint(0.9, 1.0)
+
+
+def test_colour_curves_blend_between_appearances_and_adaptation():
+    from spotter_volume.glass import LUMA_DARK, LUMA_LIGHT, color_curves
+    assert color_curves(0.0, 0.0)[0] == list(LUMA_DARK[0])
+    assert color_curves(1.0, 1.0)[0] == list(LUMA_LIGHT[-1])
+    mid = color_curves(0.5, 0.0)[0]
+    assert all(abs(m - (a + b) / 2) < 1e-9 for m, a, b in zip(mid, LUMA_DARK[0], LUMA_LIGHT[0]))
 
 
 class _Frames:

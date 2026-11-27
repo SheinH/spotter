@@ -59,7 +59,8 @@ GREEN = DARK.green
 MATERIAL = QColor(28, 28, 30)            # systemGray6, opaque (Apple's Reduce Transparency look)
 RIM = QColor(255, 255, 255, 26)
 RIM_HIGH_CONTRAST = QColor(255, 255, 255, 140)
-GLASS_RIM = QColor(255, 255, 255, 46)
+GLASS_RIM = QColor(255, 255, 255, 0)     # Apple's glass draws no stroke (fitted alpha ~0.003)
+SOLID_SHADOW = glass.GlassParams(shadow_opacity=0.30, contact_opacity=0.0)   # the opaque card's
 
 WIDTH = 296          # card, logical px
 PAD_X, PAD_Y = 18, 15
@@ -327,7 +328,7 @@ class VolumeCard(QWidget):
         self._maps = glass.build_maps(_shape_alpha(QRectF(0, 0, card.width(), card.height()), cw, ch, dpr), dpr)
         full = _shape_alpha(card, round(self.width() * dpr), round(self.height() * dpr), dpr)
         # Liquid Glass floats on a lighter shadow than an opaque card does
-        sh = glass.shadow(full, dpr, opacity=0.16 if glassy else 0.30)
+        sh = glass.shadow(full, dpr, glass.GlassParams() if glassy else SOLID_SHADOW)
         rgba = np.zeros(sh.shape + (4,), np.uint8)
         rgba[..., 3] = (sh * 255 + 0.5).astype(np.uint8)        # black, premultiplied
         self._shadow = _qimage(rgba, dpr)
@@ -429,10 +430,7 @@ class VolumeCard(QWidget):
         if self._gpu is None or not self._gpu.ready or not self.glass_wanted:
             self.update()
             return
-        p = self._gpu.p
-        tint = tuple((a + (b - a) * self._light) / 255.0 for a, b in zip(p.tint_dark, p.tint_light))
-        alpha = glass.legibility_tint(self._luma, self._light, p)
-        self._glass = _qimage(self._gpu.compose(self._amount, tint, alpha), self._dpr())
+        self._glass = _qimage(self._gpu.compose(self._amount, self._light, self._luma), self._dpr())
         self.composes += 1
         self.update()
 
