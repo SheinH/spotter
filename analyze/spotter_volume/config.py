@@ -23,6 +23,8 @@ class Config:
     hotkey: str = "Home"               # show/hide by hand; "" to disable
     style: str = "solid"               # "solid" | "glass" (live Liquid Glass on the GPU; the
                                        # card is then left out of screenshots and recordings)
+    appearance: str = "auto"           # glass only: "auto" (light over bright backdrops,
+                                       # dark otherwise) | "dark" | "light"
 
     @classmethod
     def load(cls, path: Path = PATH) -> "Config":

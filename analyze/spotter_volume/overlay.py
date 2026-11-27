@@ -186,7 +186,7 @@ class VolumeCard(QWidget):
         self._backdrop = capture.Backdrop()
         self._appearance = glass.Appearance()
         self._luma = 0.0
-        self._light = 0.0                        # 0 dark .. 1 light, animated
+        self._light = 1.0 if cfg.appearance == "light" else 0.0   # 0 dark .. 1 light, animated
         self._amount = 1.0                       # materialize progress, 0..1
         self.prefs = capture.windows_prefs()
         self.composes = 0
@@ -421,7 +421,8 @@ class VolumeCard(QWidget):
         ox, oy = offset
         under = rgb[max(oy, 0):oy + h, max(ox, 0):ox + w]
         self._luma = glass.backdrop_luma(under if under.size else rgb)
-        light = 1.0 if self._appearance.update(self._luma) else 0.0
+        fixed = {"dark": 0.0, "light": 1.0}.get(self.cfg.appearance)
+        light = fixed if fixed is not None else (1.0 if self._appearance.update(self._luma) else 0.0)
         self._renderer().set_backdrop(rgb, offset)
         self._bd = _qimage_rgb(rgb, self._dpr())
         self._bd_offset = (ox, oy)

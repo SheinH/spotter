@@ -430,6 +430,17 @@ def test_glass_card_is_really_left_out_of_capture(qapp, monkeypatch):
     card.close()
 
 
+def test_appearance_setting_locks_dark_glass(qapp):
+    _gpu_or_skip()
+    from spotter_volume.overlay import VICINITY, VolumeCard, WIDTH
+    card = VolumeCard(Config(style="glass", appearance="dark"))
+    card.prefs = {"transparency": True, "animations": False, "high_contrast": False}
+    h, m = card._card_height(), VICINITY
+    card.set_backdrop(np.full((h + 2 * m, WIDTH + 2 * m, 3), 240, np.uint8), (m, m))
+    assert card.glass_ok and card._light == 0.0          # bright backdrop, still dark glass
+    card.close()
+
+
 def test_omp_threads_sleep_instead_of_spinning():
     import os
     import spotter_volume  # noqa: F401
