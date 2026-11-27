@@ -406,6 +406,36 @@ def test_glass_does_nothing_while_hidden_or_when_windows_says_no(qapp, monkeypat
     solid.close()
 
 
+@pytest.mark.skipif(__import__("sys").platform != "win32", reason="Windows capture exclusion")
+def test_glass_card_is_really_left_out_of_capture(qapp, monkeypatch):
+    """Regression: Windows 10 refuses capture exclusion for per-pixel-alpha windows, and the
+    glass then refracted its own previous frame forever. Glass mode must use an opaque window
+    on which the exclusion sticks, and fall back to the translucent solid card otherwise."""
+    import ctypes
+    from ctypes import wintypes
+    import spotter_volume.capture as cap
+    from PySide6.QtCore import Qt
+    monkeypatch.setattr(cap.Backdrop, "grab", lambda self, *a, **k: None)
+    monkeypatch.setattr(cap, "windows_prefs",
+                        lambda: {"transparency": True, "animations": False, "high_contrast": False})
+    card = _glass_card()
+    assert not card.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+    card.present()
+    got = wintypes.DWORD()
+    ctypes.windll.user32.GetWindowDisplayAffinity(wintypes.HWND(int(card.winId())), ctypes.byref(got))
+    assert got.value == 0x11 and card.glass_wanted
+    card._fall_back("test")                      # solid from here on: per-pixel alpha again
+    assert card.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground) and not card.glass_wanted
+    assert card.isVisible()
+    card.close()
+
+
+def test_omp_threads_sleep_instead_of_spinning():
+    import os
+    import spotter_volume  # noqa: F401
+    assert os.environ.get("OMP_WAIT_POLICY", "").upper() == "PASSIVE"
+
+
 def test_restarts_go_to_the_run_they_lead_up_to():
     from spotter_volume.ledger import Run, attribute
     t = lambda m: datetime(2026, 11, 27, 1, 0) + timedelta(minutes=m)

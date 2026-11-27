@@ -66,9 +66,10 @@ WIDTH = 296          # card, logical px
 PAD_X, PAD_Y = 18, 15
 RADIUS = 22          # continuous corners read smaller than circular ones, so a bit larger
 SHADOW = 48          # room around the card for its (wide, soft) shadow
+# logical px around the card the glass samples: 3 sigma of frost plus the strongest refraction
+VICINITY = max(SHADOW, math.ceil(3 * glass.GlassParams().blur_px + glass.GlassParams().max_shift_px))
 GAIN_HOLD_MS = 7000  # how long "+1:02" stays before fading
 GLASS_FPS = 30       # how often the glass looks for a changed backdrop while the card is up
-VICINITY = 40        # logical px around the card the glass can sample (refraction + frost)
 MATERIALIZE_MS = 320
 APPEARANCE_MS = 200
 
@@ -160,9 +161,15 @@ class VolumeCard(QWidget):
                          | Qt.WindowType.Tool
                          | Qt.WindowType.WindowTransparentForInput
                          | Qt.WindowType.WindowDoesNotAcceptFocus)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        # Glass needs the card left out of screen capture, and Windows 10 refuses that for
+        # per-pixel-alpha (layered) windows. So in glass mode the window is opaque and paints
+        # the live capture under its own corners and shadow; the solid card stays translucent.
+        self._opaque = cfg.style == "glass"
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, not self._opaque)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.cfg = cfg
+        self._bd: QImage | None = None           # last capture around the card (glass mode)
+        self._bd_offset = (0, 0)                 # the card's top-left inside it, device px
         self.fonts = Fonts(cfg)
         self.summary: Summary | None = None
         self.loading = True
@@ -204,8 +211,6 @@ class VolumeCard(QWidget):
         self.resize(WIDTH + 2 * SHADOW, self._card_height() + 2 * SHADOW)
         self._live = QTimer(self, interval=1000 // GLASS_FPS)
         self._live.timeout.connect(self._tick_glass)
-        if cfg.style == "glass":
-            _exclude_from_capture(self)         # the glass must never see the card itself
 
     # --- data ----------------------------------------------------------------------------
 
@@ -229,7 +234,7 @@ class VolumeCard(QWidget):
 
     @property
     def glass_wanted(self) -> bool:
-        return (self.cfg.style == "glass" and self.glass_ok is not False
+        return (self.cfg.style == "glass" and self._opaque and self.glass_ok is not False
                 and self.prefs["transparency"] and not self.prefs["high_contrast"])
 
     def present(self) -> None:
@@ -237,6 +242,11 @@ class VolumeCard(QWidget):
             return
         self.prefs = capture.windows_prefs()
         self._place()
+        if self._opaque and not self.glass_wanted:
+            self._make_translucent()            # glass off (Windows settings, or it failed)
+        elif self.glass_wanted and not _exclude_from_capture(self):
+            # the glass would capture (and refract) itself; never show that
+            self._fall_back("Windows would not leave the card out of screen capture")
         self._ensure_maps()
         animate = self.prefs["animations"]
         if self.glass_wanted:
@@ -350,12 +360,26 @@ class VolumeCard(QWidget):
             log.warning("glass off, using the solid card: %s", why)
         self.glass_ok = False
         self._glass = None
+        self._bd = None
         self._live.stop()
         self._materialize.stop()
         self._amount = 1.0
         self.setWindowOpacity(1.0)
+        if self._opaque:
+            self._make_translucent()
         self._ensure_maps()                     # the solid card's (darker) shadow
         self.update()
+
+    def _make_translucent(self) -> None:
+        """Switch the window to per-pixel alpha for the solid card (recreates the native
+        window, which is how Qt applies this)."""
+        visible = self.isVisible()
+        self._opaque = False
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setWindowFlags(self.windowFlags())
+        if visible:
+            self.show()
+            _keep_on_top(self)
 
     def _capture_rect(self) -> tuple[tuple[int, int, int, int], int]:
         """Desktop rect (physical px) of the card plus everything the glass samples around
@@ -399,6 +423,8 @@ class VolumeCard(QWidget):
         self._luma = glass.backdrop_luma(under if under.size else rgb)
         light = 1.0 if self._appearance.update(self._luma) else 0.0
         self._renderer().set_backdrop(rgb, offset)
+        self._bd = _qimage_rgb(rgb, self._dpr())
+        self._bd_offset = (ox, oy)
         self.glass_ok = True
         if light != self._light_target():
             if self.prefs["animations"] and self.isVisible():
@@ -467,6 +493,13 @@ class VolumeCard(QWidget):
         glassy = self._glass is not None and self.glass_wanted
         amount = self._amount if glassy else 1.0
         pal = mix_palette(self._light) if glassy else DARK
+        if self._opaque:
+            # the window has no alpha: put back what is behind it (the same frame the glass
+            # was made from), then draw the card over it as if the window were transparent
+            p.fillRect(self.rect(), QColor(0, 0, 0))
+            if self._bd is not None:
+                dpr = self._dpr()
+                p.drawImage(QPointF(SHADOW - self._bd_offset[0] / dpr, SHADOW - self._bd_offset[1] / dpr), self._bd)
         if glassy and amount < 1.0:             # materialize: grow in from 96% around the centre
             k = 0.96 + 0.04 * amount
             c = card.center()
@@ -615,16 +648,32 @@ def _qimage(rgba: np.ndarray, dpr: float) -> QImage:
     return img
 
 
-def _exclude_from_capture(w: QWidget) -> None:
+def _qimage_rgb(rgb: np.ndarray, dpr: float) -> QImage:
+    h, w = rgb.shape[:2]
+    data = np.ascontiguousarray(rgb, np.uint8)
+    img = QImage(data.data, w, h, w * 3, QImage.Format.Format_RGB888).copy()
+    img.setDevicePixelRatio(dpr)
+    return img
+
+
+def _exclude_from_capture(w: QWidget) -> bool:
     """Windows 10 2004+: leave this window out of screen capture, so the live glass never
     captures the card itself. Side effect: in glass mode the card is also missing from your own
-    screenshots and recordings (the solid card is not excluded)."""
+    screenshots and recordings (the solid card is not excluded). Returns whether Windows
+    actually applied it: it silently refuses per-pixel-alpha windows on Windows 10."""
     if sys.platform != "win32":
-        return
+        return False
+    from ctypes import wintypes
+    WDA_EXCLUDEFROMCAPTURE = 0x11
     try:
-        ctypes.windll.user32.SetWindowDisplayAffinity(int(w.winId()), 0x11)   # WDA_EXCLUDEFROMCAPTURE
+        u = ctypes.windll.user32
+        hwnd = wintypes.HWND(int(w.winId()))
+        u.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+        got = wintypes.DWORD()
+        u.GetWindowDisplayAffinity(hwnd, ctypes.byref(got))
+        return got.value == WDA_EXCLUDEFROMCAPTURE
     except (AttributeError, OSError):
-        pass
+        return False
 
 
 def _keep_on_top(w: QWidget) -> None:

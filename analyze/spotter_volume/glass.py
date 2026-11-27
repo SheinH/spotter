@@ -193,8 +193,8 @@ def shadow(alpha: np.ndarray, scale: float, p: GlassParams = GlassParams()) -> n
 
 def backdrop_luma(rgb: np.ndarray) -> float:
     """Mean Rec. 709 luma (0..1) of what is behind the card; a coarse sample is plenty."""
-    s = rgb[::4, ::4].astype(np.float32) / 255.0
-    return float((s @ np.array([0.2126, 0.7152, 0.0722], np.float32)).mean())
+    s = rgb[::4, ::4].astype(np.float32).mean(axis=(0, 1)) / 255.0   # no BLAS: no worker threads
+    return float(0.2126 * s[0] + 0.7152 * s[1] + 0.0722 * s[2])
 
 
 class Appearance:
