@@ -87,7 +87,7 @@ class Backdrop:
 
     def _open(self, mon) -> None:
         import dxcam
-        factory = dxcam.DXFactory()
+        factory = getattr(dxcam, "__factory", None) or dxcam.DXFactory()   # its one instance
         pick = (0, 0)
         for d, outs in enumerate(factory.outputs):
             for o, out in enumerate(outs):

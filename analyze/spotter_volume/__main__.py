@@ -101,6 +101,7 @@ class App:
         self.qapp, self.cfg = qapp, cfg
         self.runs_dir, self.stats_dir, self.data_dir = runs_dir, stats_dir, data_dir
         self.card = VolumeCard(cfg)
+        QTimer.singleShot(0, self.card.warm_up)     # GPU context + shaders now, not on first show
         self.ledger = Ledger(stats_dir, data_dir)
         self._pool = ThreadPoolExecutor(max_workers=1)
         self._loading: Future | None = self._pool.submit(self.ledger.load)

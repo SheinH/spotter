@@ -333,6 +333,17 @@ class VolumeCard(QWidget):
         self._shadow = _qimage(rgba, dpr)
         self._maps_key = key
 
+    def warm_up(self) -> None:
+        """Create the GL context and compile the shaders ahead of time (~150 ms), so the first
+        time the card shows it is as quick as every other time."""
+        if not self.glass_wanted:
+            return
+        try:
+            self._ensure_maps()
+            self._renderer()
+        except Exception as e:
+            self._fall_back(f"{type(e).__name__}: {e}")
+
     def _fall_back(self, why: str) -> None:
         if self.glass_ok is not False:
             log.warning("glass off, using the solid card: %s", why)
