@@ -62,14 +62,16 @@ REV_WIN = 0.15           # s; a reversal compares target velocity this long befo
 REV_MIN_DPS = 6.0        # target speed both sides of a reversal
 
 
-def mm_per_deg(fields: dict | None) -> float | None:
-    """Mouse millimetres per degree of yaw, from the stats CSV, or None if unknown."""
-    if not fields or fields.get("Sens Scale", "").strip().lower() != "cm/360":
-        return None
-    try:
-        return float(fields["Horiz Sens"]) * 10.0 / 360.0
-    except (KeyError, ValueError):
-        return None
+def mm_per_deg(fields: dict | None, run: Run | None = None):
+    """Mouse millimetres per degree of yaw, or None if unknown. With a v3 log the result is a
+    per-frame array that follows the live sensitivity (sens randomizer); otherwise a float from
+    the stats CSV."""
+    from . import sens
+    live = sens.cm360(run, fields) if run is not None else None
+    if live is not None:
+        return live * 10.0 / 360.0
+    base = sens.configured_cm360(fields)
+    return None if base is None else base * 10.0 / 360.0
 
 
 def _sos(lo: float, hi: float):
@@ -81,25 +83,32 @@ def _rms_env(x: np.ndarray, width_s: float) -> np.ndarray:
     return np.sqrt(np.convolve(x ** 2, np.ones(n) / n, mode="same"))
 
 
-def hand(run: Run, scale: float):
-    """Uniform-grid hand velocity (vx, vy) in output units/s, plus the grid."""
+def hand(run: Run, scale):
+    """Uniform-grid hand velocity (vx, vy) in output units/s, plus the grid and the per-sample
+    scale. `scale` is a float or a per-frame array (live sensitivity)."""
     tu = np.arange(run.t[0], run.t[-1], 1.0 / FS)
     yaw = np.interp(tu, run.t, np.unwrap(run.yaw, period=360))
     pitch = np.interp(tu, run.t, run.pitch)
-    return tu, np.gradient(yaw, 1 / FS) * scale, np.gradient(pitch, 1 / FS) * scale
+    s = np.interp(tu, run.t, scale) if np.ndim(scale) else np.full(len(tu), float(scale))
+    return tu, np.gradient(yaw, 1 / FS) * s, np.gradient(pitch, 1 / FS) * s, s
 
 
-def analyze(run: Run, mode: str, mmpd: float | None) -> dict:
-    scale = mmpd or 1.0
-    unit = "mm/s" if mmpd else "deg/s"
-    tu, vx, vy = hand(run, scale)
+def analyze(run: Run, mode: str, mmpd) -> dict:
+    """mmpd: mm per degree as a float, a per-frame array (live sens), or None (report deg/s)."""
+    known = mmpd is not None
+    per_frame = mmpd if known else 1.0
+    # Hand-velocity series use the live value; numbers computed in degrees (on-target jitter)
+    # are converted with the run's median, which is exact when the sens did not change mid-run.
+    scale = float(np.nanmedian(mmpd)) if np.ndim(per_frame) else float(per_frame)
+    unit = "mm/s" if known else "deg/s"
+    tu, vx, vy, s_tu = hand(run, per_frame)
     if len(tu) < 4 * FS:
         return {"summary": [], "splits": []}
     sos = _sos(*BAND)
     jx, jy = signal.sosfiltfilt(sos, vx), signal.sosfiltfilt(sos, vy)
     jit = _rms_env(np.hypot(jx, jy), 0.25)
     # Pauses and hands off the mouse would drag every median down; keep active time only.
-    active = np.convolve(np.hypot(vx, vy), np.ones(int(FS)) / FS, mode="same") > (5.0 if mmpd else 6.0)
+    active = np.convolve(np.hypot(vx, vy), np.ones(int(FS)) / FS, mode="same") > (5.0 if known else 6.0)
 
     ja = jit[active]
     thirds = [float(np.median(x)) for x in np.array_split(ja, 3)]
@@ -138,7 +147,7 @@ def analyze(run: Run, mode: str, mmpd: float | None) -> dict:
            "hold_range90": tuple(x * scale for x in hold.get("range90", (float("nan"),) * 2)), "hold_thirds": [x * scale for x in hold["thirds"]],
            "tremor": hold["tremor"], "unit": unit}
     if mode in ("clicking", "switching"):
-        fl = flicks(tu, vx / scale, vy / scale)
+        fl = flicks(tu, vx / s_tu, vy / s_tu)
         out["flicks"] = fl
         if len(fl) >= 6:
             out["summary"] += _flick_summary(fl)

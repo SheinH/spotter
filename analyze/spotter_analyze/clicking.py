@@ -9,9 +9,25 @@ import numpy as np
 from .format import BTN_FIRE, Run
 from .geometry import OCTANTS, octant, smooth, target_view, view
 
-COLUMNS = ["i", "t_s", "dist_deg", "dir", "react_ms", "peak_dps", "land_r", "off_r", "over_r",
-           "past_ms", "corr", "acq_ms", "confirm_ms", "ttk_ms", "shots", "miss", "on_pct", "slips", "slip_ms"]
-SETTLE_MS = 50.0     # on target this long without a break = settled; later drift is tracking, not overflick
+COLUMNS = ["i", "t_s", "dist_deg", "dir", "react_ms", "flick_ms", "micro_ms", "peak_dps", "land_r", "off_r",
+           "over_r", "past_ms", "corr", "acq_ms", "confirm_ms", "ttk_ms", "shots", "miss", "on_pct", "slips",
+           "slip_ms", "brake", "wobble_r"]
+# Braking: peak deceleration of the flick over its peak acceleration, from crosshair speed
+# smoothed over BRAKE_SMOOTH samples (~22 ms at 400 Hz). A minimum-jerk flick is symmetric (1.0);
+# clamping down to stop it brakes harder than it pushed (>1); releasing mid-flick and coasting
+# in brakes softer (<1). The deceleration is looked for until BRAKE_TAIL_MS after the flick ends.
+# Only flicks of BRAKE_MIN_DEG+ count: tiny nudges have no clear push and stop.
+BRAKE_SMOOTH = 9
+BRAKE_TAIL_MS = 60.0
+BRAKE_MIN_DEG = 3.0
+# Post-flick wobble: in the WOBBLE_MS after the flick ends, how much the crosshair moved
+# against the target beyond the straight line to where it ended up (path length minus net
+# change, in target radii, error smoothed over WOBBLE_SMOOTH samples). A clean correction or a
+# clean landing reads ~0; bouncing, overshooting the correction or shaking reads high. Measured
+# against the target, so following a moving one is not wobble.
+WOBBLE_MS = 150.0
+WOBBLE_SMOOTH = 7
+SETTLE_MS = 50.0    # on target this long without a break = settled; later drift is tracking, not overflick
 # Off target this long after settling = a slip. From 1025 kills of voxTargetSwitch 2 (Nov 2026): off
 # stretches under 10 ms graze the edge by ~1% of a radius, 10-20 ms is nearly empty, and from 20 ms up
 # they run continuously to 400+ ms and hold almost all off-target time.
@@ -28,7 +44,10 @@ PATH_LEGEND = (
 LEGEND = (
     "One row per kill, timed from the previous kill (or the target's spawn if later). "
     "dist_deg=flick distance; dir=screen direction to the target; react_ms=start until the hand "
-    "moves; peak_dps=peak crosshair speed; land_r=where the first movement ended along the flick "
+    "moves; flick_ms=hand starts moving until the first movement ends (speed down to a quarter "
+    "of its peak); micro_ms=from there until settled on the target (on it for "
+    f"{SETTLE_MS:.0f} ms, or still on it at the kill), 0 if the flick landed and stayed; "
+    "peak_dps=peak crosshair speed; land_r=where the first movement ended along the flick "
     "line in target radii (- short, + past, |x|<1 on target); off_r=total distance from centre at "
     "that moment, radii; over_r=furthest past the target centre along the flick line, from peak "
     f"speed until settled on target ({SETTLE_MS:.0f} ms on it) or the kill, radii (>1 = beyond the "
@@ -38,7 +57,11 @@ LEGEND = (
     "(E fired before arriving, O past the target, D was on target then left); "
     "on_pct=share of time on target after first reaching it; "
     f"slips=times you left the target for {SLIP_MS:.0f}+ ms after settling on it and came back "
-    "before it died; slip_ms=total time off the target in those slips."
+    "before it died; slip_ms=total time off the target in those slips; "
+    "brake=peak deceleration of the flick over its peak acceleration (1 = symmetric, >1 = stopped "
+    f"harder than you pushed, <1 = coasted in; flicks of {BRAKE_MIN_DEG:.0f}+ deg); wobble_r=back-and-forth "
+    f"against the target in the {WOBBLE_MS:.0f} ms after the flick ended, beyond the straight line to "
+    "where it ended up, radii (0 = clean)."
 )
 
 
@@ -157,8 +180,8 @@ def analyze(run: Run, mode: str = "clicking") -> dict:
         row = {"t_s": float(run.t[s] - run.t[0]), "dist_deg": dist, "dir": octant(ex[0], ey[0]),
                "ttk_ms": float((run.t[k] - run.t[s]) * 1000.0)}
         nan = float("nan")
-        row.update(react_ms=nan, peak_dps=nan, land_r=nan, off_r=nan, over_r=nan, past_ms=nan,
-                   corr=0, acq_ms=nan, confirm_ms=nan, on_pct=nan)
+        row.update(react_ms=nan, flick_ms=nan, micro_ms=nan, peak_dps=nan, land_r=nan, off_r=nan, over_r=nan, past_ms=nan,
+                   corr=0, acq_ms=nan, confirm_ms=nan, on_pct=nan, brake=nan, wobble_r=nan)
 
         if dist > arad[0]:
             p = int(np.argmax(sp))
@@ -172,12 +195,17 @@ def analyze(run: Run, mode: str = "clicking") -> dict:
             q = p + int(ended[0]) if len(ended) else len(sp) - 1
             row["land_r"] = float(-rem[q] / arad[q])
             row["off_r"] = float(ang[q] / arad[q])
+            row["_arad_q"] = float(arad[q])
             # For flick gain: distance asked for, distance covered along the line, and sideways miss (deg)
             row["_D"], row["_M"] = g, float(g - rem[q])
             row["_lat"] = float(ex[q] * -gy + ey[q] * gx)
             row["over_r"], row["past_ms"] = _overflick(rem[p:] / arad[p:], on[p:], tt[p:])
             # with the trigger held the hand keeps moving after the flick; bumps are tracking, not corrections
             row["corr"] = float("nan") if continuous else _count_peaks(sp[q:], tt[q:], max(0.12 * peak, 8.0))
+            row["_q"], row["_peak"] = q, peak
+            if dist >= BRAKE_MIN_DEG:
+                row["brake"] = _brake(sp, tt, onset, q)
+            row["wobble_r"] = _wobble(rem / arad, (ex * -gy + ey * gx) / arad, tt, q)
         row.update(_choice(run, v, frame_rows, tid, min(s + CHOICE_LAG, int(fr[-1]))))
         row["_off"] = _off_episodes(on, v.miss[rows] / arad, tt)
         slips = [e for e in row["_off"] if e[0] >= SLIP_MS]
@@ -185,6 +213,7 @@ def analyze(run: Run, mode: str = "clicking") -> dict:
         row["slip_ms"] = float(sum(e[0] for e in slips))
         row["_wait_ms"] = float((run.t[s] - run.t[prev_window]) * 1000.0) if prev_window else 0.0
         row["_budget"] = _budget(row, on, tt)
+        row.update(_phases(row, on, tt, sp))
         if on.any():
             first_on = int(np.argmax(on))
             row["acq_ms"] = float(tt[first_on])
@@ -275,6 +304,15 @@ def analyze(run: Run, mode: str = "clicking") -> dict:
                      f"{np.median([e[1] for e in eps]):.2f} radii outside the edge")
         summary.append(line)
 
+    brake, wob = col("brake"), col("wobble_r")
+    if len(brake) >= 8:
+        summary.append(
+            f"stops: braking ratio {np.median(brake):.2f} (peak stopping force over peak pushing force, median of "
+            f"{len(brake)} flicks; 1 = symmetric, above 1 = clamped to stop, below 1 = let go and coasted in); "
+            f"stopped harder than you pushed on {100 * np.mean(brake > 1):.0f}% of flicks"
+            + (f"; post-flick wobble median {np.median(wob):.2f} radii in the first {WOBBLE_MS:.0f} ms "
+               f"(back-and-forth against the target beyond a straight correction; 0 = clean)" if len(wob) >= 8 else ""))
+
     fg = flick_gain(table)
     if fg:
         if fg["slope"] < 0.95:
@@ -304,6 +342,10 @@ def analyze(run: Run, mode: str = "clicking") -> dict:
                      "(a rough what-if: the nearest target is not always the best path)")
         summary.append(line)
 
+    fm = flick_micro(table)
+    if fm:
+        summary += fm["summary"]
+
     b_cols, b_rows, b_share = time_budget(table, continuous)
     cuttable = [(lab, r[5]) for (key, lab), r in zip(BUDGET_PARTS, b_rows) if not math.isnan(r[5])]
     saved = sum(s for _l, s in cuttable)
@@ -316,7 +358,8 @@ def analyze(run: Run, mode: str = "clicking") -> dict:
         f"about {1000 * saved / mean_ttk:.0f} kills (most from {top[0]}: {top[1]:.1f}s)")
 
     # --- splits ---
-    head = ["n", "ttk_ms", "react_ms", "land_r", "gain", "over_pct", "past_ms", "slip_pct", "corr", "confirm_ms", "misses"]
+    head = ["n", "ttk_ms", "react_ms", "flick_ms", "micro_ms", "land_r", "gain", "over_pct", "past_ms", "slip_pct",
+            "brake", "wobble_r", "corr", "confirm_ms", "misses"]
 
     def gain_med(rows):
         g = [r["_M"] / r["_D"] for r in rows if "_D" in r and r["_D"] >= 3.0]
@@ -328,13 +371,17 @@ def analyze(run: Run, mode: str = "clicking") -> dict:
 
     def agg(rows):
         big = [r for r in rows if r["over_r"] > 1.0]
-        return [len(rows), med("ttk_ms", rows), med("react_ms", rows), med("land_r", rows),
+        return [len(rows), med("ttk_ms", rows), med("react_ms", rows), med("flick_ms", rows),
+                med("micro_ms", rows), med("land_r", rows),
                 gain_med(rows), over_pct(rows), med("past_ms", big) if big else float("nan"), slip_pct(rows),
+                med("brake", rows), med("wobble_r", rows),
                 float(np.mean(col("corr", rows))) if len(col("corr", rows)) else float("nan"),
                 med("confirm_ms", rows), sum(r["_miss_n"] for r in rows)]
 
     splits = [("Time budget (where the kill time went; saved_s = if each kill's part were no longer than "
                "your own 25th percentile this run, a rough what-if)", b_cols, b_rows)]
+    if fm:
+        splits += fm["splits"]
     dists = np.array([r["dist_deg"] for r in table])
     if len(table) >= 9:
         # fixed edges, the same in every run, so runs can be compared and pooled
@@ -376,7 +423,11 @@ def analyze(run: Run, mode: str = "clicking") -> dict:
         "flick_gain": fg["gain"] if fg else float("nan"),
         "flick_spread_pct": fg["spread_pct"] if fg else float("nan"),
         "off_after_pct": b_share["settle"][0] + b_share["slip"][0],
+        "brake_ratio": float(np.median(brake)) if len(brake) >= 8 else float("nan"),
+        "wobble_r": float(np.median(wob)) if len(wob) >= 8 else float("nan"),
     }
+    if fm:
+        metrics.update(fm["metrics"])
     if path:
         metrics.update(nearest_pct=path["nearest_pct"], extra_deg=path["extra_deg"])
     if continuous:
@@ -447,6 +498,159 @@ def _budget(row: dict, on: np.ndarray, tt: np.ndarray) -> dict:
     off_ms = float(dt[after & ~on].sum())
     slip = min(row["slip_ms"], off_ms)
     return {"react": react, "travel": acq - react, "settle": off_ms - slip, "slip": slip, "on": on_ms}
+
+
+def _settle_start(on: np.ndarray, tt: np.ndarray) -> int | None:
+    """Start of the first on-target stretch that lasts SETTLE_MS, or that is still going at the
+    kill (a quick clicker shoots before SETTLE_MS is up)."""
+    i = 0
+    while i < len(on):
+        if on[i]:
+            j = i
+            while j < len(on) and on[j]:
+                j += 1
+            if j == len(on) or tt[j] - tt[i] >= SETTLE_MS:
+                return i
+            i = j
+        else:
+            i += 1
+    return None
+
+
+def _phases(row: dict, on: np.ndarray, tt: np.ndarray, sp: np.ndarray) -> dict:
+    """Split one kill into reaction + flick + micro + after settling (ms; adds up to ttk_ms).
+    flick: hand starts moving until the first movement ends. micro: from there until settled on
+    the target. after: settled until the kill (confirm / time under fire, slips included).
+    Also how the micro went: corrective sub-movements, and times it touched the target and fell
+    off again before settling."""
+    ttk = row["ttk_ms"]
+    s = _settle_start(on, tt)
+    settle_t = float(tt[s]) if s is not None else ttk
+    if "_q" not in row:                        # started on the target: nothing to flick
+        return {"flick_ms": 0.0, "micro_ms": settle_t,
+                "_phase": {"react": 0.0, "flick": 0.0, "micro": settle_t, "after": ttk - settle_t}}
+    q = row["_q"]
+    react = row["react_ms"]
+    flick_end = float(tt[q])
+    micro = max(settle_t - flick_end, 0.0)
+    out = {"flick_ms": flick_end - react, "micro_ms": micro,
+           "_phase": {"react": react, "flick": flick_end - react, "micro": micro, "after": ttk - flick_end - micro},
+           "_micro_corr": 0, "_micro_touch": 0}
+    if micro > 0:
+        end = s if s is not None else len(on) - 1
+        seg = on[q:end + 1]
+        out["_micro_corr"] = _count_peaks(sp[q:end + 1], tt[q:end + 1], max(0.12 * row["_peak"], 8.0))
+        out["_micro_touch"] = int(np.sum(seg[1:-1] & ~seg[2:]))   # on, then off again, before settling
+    return out
+
+
+def _pct_bar(x: np.ndarray, band: np.ndarray | None = None) -> np.ndarray:
+    """Each kill's own-best-quarter bar: 25th percentile, per distance band when it has 8+ kills."""
+    bar = np.full(len(x), np.percentile(x, 25))
+    if band is not None:
+        for b in np.unique(band):
+            m = band == b
+            if m.sum() >= 8:
+                bar[m] = np.percentile(x[m], 25)
+    return bar
+
+
+LEFT_BINS = [("landed (<=1 r)", -1.0, 1.0), ("1-2 r", 1.0, 2.0), ("2-4 r", 2.0, 4.0), (">4 r", 4.0, 1e9)]
+
+
+def flick_micro(table: list[dict]) -> dict | None:
+    """Judge the flick and the micro-adjustment separately.
+
+    Flick: time (a fixed part + ms per degree), and how close it got: landed on the target %,
+    error left as % of the flick distance. Micro: time and corrections, split by how far the
+    flick left you (left_r = distance from the target centre when the flick ended, radii).
+    Blame: each micro is held to your own 25th percentile for the same leftover (LEFT_BINS).
+    Up to that bar is what the flick's leftover costs even with a good micro (flick_cost_s);
+    beyond it is the micro being slower than you can do it (micro_saved_s). flick_saved_s =
+    flick time beyond your own 25th percentile in the same distance band.
+    """
+    rows = [r for r in table if "_q" in r]
+    if len(rows) < 8:
+        return None
+    d = np.array([r["dist_deg"] for r in rows])
+    fl = np.array([r["flick_ms"] for r in rows])
+    mi = np.array([r["micro_ms"] for r in rows])
+    left = np.array([r["off_r"] for r in rows])
+    err = 100 * left * np.array([r["_arad_q"] for r in rows]) / np.maximum(d, 1e-6)
+    landed = left <= 1.0
+    corr = np.array([r["_micro_corr"] for r in rows], dtype=float)
+    touch = np.array([r["_micro_touch"] for r in rows], dtype=float)
+    had = mi > 0
+    ph = {k: np.array([r["_phase"][k] for r in table]) for k in ("react", "flick", "micro", "after")}
+    total = sum(float(v.sum()) for v in ph.values()) or 1.0
+    mean_ttk = float(np.mean([r["ttk_ms"] for r in table]))
+    nan = float("nan")
+
+    def mean_or0(x, m):
+        return float(x[m].mean()) if m.any() else 0.0
+
+    def med_or_nan(x, m):
+        return float(np.median(x[m])) if m.any() else nan
+
+    ms_per_deg, fl0 = np.polyfit(d, fl, 1) if np.ptp(d) > 3.0 else (nan, float(np.median(fl)))
+    band = np.array([next(i for i, (_l, lo, hi) in enumerate(DIST_BINS) if lo <= x < hi) for x in d])
+    flick_saved = float(np.maximum(fl - _pct_bar(fl, band), 0).sum()) / 1000.0
+    lband = np.array([next(i for i, (_l, lo, hi) in enumerate(LEFT_BINS) if lo < x <= hi) for x in left])
+    mbar = _pct_bar(mi, lband)
+    micro_saved = float(np.maximum(mi - mbar, 0).sum()) / 1000.0
+    flick_cost = float(np.minimum(mi, mbar).sum()) / 1000.0
+
+    share = {k: 100 * float(v.sum()) / total for k, v in ph.items()}
+    summary = [
+        f"switch phases: reaction {share['react']:.0f}%, flick {share['flick']:.0f}%, micro-adjust "
+        f"{share['micro']:.0f}%, after settling {share['after']:.0f}% of kill time (median flick "
+        f"{np.median(fl):.0f} ms, median micro {np.median(mi):.0f} ms)",
+        f"flick verdict: lands on the target {100 * landed.mean():.0f}% of the time and leaves a median "
+        f"{np.median(err):.0f}% of the distance ({np.median(left):.1f} radii) to fix"
+        + ("" if math.isnan(ms_per_deg) else f"; takes {fl0:.0f} ms + {ms_per_deg:.1f} ms per degree")
+        + f"; each flick no slower than your best quarter would save {flick_saved:.1f}s",
+        "micro verdict: "
+        + (f"{med_or_nan(mi, landed):.0f} ms after a flick that landed, " if landed.any() else "no flick landed, ")
+        + (f"{med_or_nan(mi, ~landed):.0f} ms after one that missed" if (~landed).any() else "none missed")
+        + f"; {mean_or0(corr, had):.1f} corrections and "
+        f"{mean_or0(touch, had):.1f} touch-and-fall-offs per micro"
+        + f"; of the run's {mi.sum() / 1000:.1f}s of micro, {flick_cost:.1f}s is what the flick left (your "
+        f"best-quarter micro for that leftover would still take it) and {micro_saved:.1f}s is the micro "
+        "being slower than your own best for the same leftover",
+    ]
+    big, small = sorted([("flick", flick_saved), ("micro", micro_saved)], key=lambda x: -x[1])
+    summary.append(f"bigger opportunity: the {big[0]} ({big[1]:.1f}s back against {small[1]:.1f}s for the "
+                   f"{small[0]}, about {1000 * (big[1] - small[1]) / mean_ttk:.0f} kills apart)")
+
+    head = ["n", "react_ms", "flick_ms", "micro_ms", "after_ms", "landed_pct", "err_pct", "left_r",
+            "micro_corr", "touches"]
+    rp = np.array([r["_phase"]["react"] for r in rows])
+    af = np.array([r["_phase"]["after"] for r in rows])
+
+    def agg(m):
+        return [int(m.sum()), float(np.median(rp[m])), float(np.median(fl[m])), float(np.median(mi[m])),
+                float(np.median(af[m])), 100 * float(landed[m].mean()), float(np.median(err[m])),
+                float(np.median(left[m])), mean_or0(corr, m & had), mean_or0(touch, m & had)]
+
+    by_dist = [[lab] + agg(m) for lab, lo, hi in DIST_BINS if (m := (d >= lo) & (d < hi)).any()]
+    by_dist.append(["all"] + agg(np.ones(len(rows), dtype=bool)))
+    by_left = [[lab, int(m.sum()), float(np.median(mi[m])), float(np.percentile(mi[m], 25)),
+                mean_or0(corr, m & had), mean_or0(touch, m & had), float(mi[m].sum()) / 1000.0]
+               for lab, lo, hi in LEFT_BINS if (m := (left > lo) & (left <= hi)).any()]
+    splits = [
+        ("Flick vs micro by flick size (medians, ms; landed_pct = flick ended on the target; err_pct = "
+         "what it left as % of the flick; left_r = same in target radii; micro_corr/touches = per micro)",
+         ["dist"] + head, by_dist),
+        ("Micro by what the flick left (radii from the centre when the flick ended: slow micro even "
+         "after landed flicks is the micro itself, slow only after big misses is the flick; "
+         "p25_ms = your best quarter for that leftover, the bar each micro is held to)",
+         ["left", "n", "micro_ms", "p25_ms", "corr", "touches", "total_s"], by_left),
+    ]
+    metrics = {"flick_ms": float(np.median(fl)), "micro_ms": float(np.median(mi)),
+               "flick_on_pct": 100 * float(landed.mean()), "flick_err_pct": float(np.median(err)),
+               "micro_corr": mean_or0(corr, had), "flick_saved_s": flick_saved, "micro_saved_s": micro_saved,
+               "flick_cost_s": flick_cost}
+    return {"summary": summary, "splits": splits, "metrics": metrics}
 
 
 BUDGET_PARTS = [("react", "reaction"), ("travel", "travel to first on target"),
@@ -553,6 +757,33 @@ def _overflick(rem_r: np.ndarray, on: np.ndarray, tt: np.ndarray) -> tuple[float
     past = -rem_r[:end]
     dt = np.diff(tt[:end], append=tt[end - 1] if end else 0.0)
     return float(max(past.max(), 0.0)) if end else 0.0, float(dt[past > 1.0].sum())
+
+
+def _brake(sp: np.ndarray, tt: np.ndarray, onset: int, q: int) -> float:
+    """Peak deceleration over peak acceleration of the flick from `onset` to the end of its
+    first movement `q` (+ BRAKE_TAIL_MS). nan when either side is too short to tell."""
+    s = smooth(sp, BRAKE_SMOOTH)
+    p = int(np.argmax(s[:q + 1])) if q >= 0 else 0
+    end = min(len(s) - 1, int(np.searchsorted(tt, tt[q] + BRAKE_TAIL_MS)))
+    if p - onset < 3 or end - p < 3:
+        return float("nan")
+    acc = np.gradient(s, tt / 1000.0)
+    push = float(acc[onset:p + 1].max())
+    stop = float(-acc[p:end + 1].min())
+    return stop / push if push > 0 else float("nan")
+
+
+def _wobble(rem_r: np.ndarray, lat_r: np.ndarray, tt: np.ndarray, q: int) -> float:
+    """Path of the error against the target in the WOBBLE_MS after the flick ended, minus the
+    straight-line change over it, in radii. nan when the kill came before the window was up."""
+    if tt[-1] < tt[q] + WOBBLE_MS:
+        return float("nan")
+    m = (tt >= tt[q]) & (tt <= tt[q] + WOBBLE_MS)
+    x, y = smooth(rem_r, WOBBLE_SMOOTH)[m], smooth(lat_r, WOBBLE_SMOOTH)[m]
+    if len(x) < 3:
+        return float("nan")
+    path = float(np.hypot(np.diff(x), np.diff(y)).sum())
+    return path - float(np.hypot(x[-1] - x[0], y[-1] - y[0]))
 
 
 def _count_peaks(sp: np.ndarray, tt: np.ndarray, threshold: float) -> int:

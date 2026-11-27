@@ -19,6 +19,9 @@ SHORT = {  # compact column names for the per-run table
     "kills_per_min": "kpm", "ttk_ms": "ttk", "acq_ms": "acq", "confirm_ms": "confirm", "peak_dps": "peak",
     "land_r": "land_r", "short_pct": "short%", "over_pct": "over%", "slip_pct": "slip%", "corr": "corr", "miss_per_kill": "miss/k",
     "flick_gain": "fgain", "flick_spread_pct": "fscatter%", "off_after_pct": "offafter%",
+    "brake_ratio": "brake", "wobble_r": "wobble_r",
+    "flick_ms": "flick", "flick_on_pct": "flick_on%", "flick_err_pct": "flick_err%", "micro_ms": "micro",
+    "micro_saved_s": "micro_slack_s", "flick_cost_s": "flick_cost_s", "micro_corr": "micro_corr",
     "nearest_pct": "nearest%", "extra_deg": "extra_deg",
     "shift_on_pct": "shift_on%", "shift_gain_pts": "lag_pts",
 }

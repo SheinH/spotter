@@ -14,7 +14,7 @@ import warnings
 from datetime import date, datetime
 from pathlib import Path
 
-from . import clicking, history, kovaaks, report, session, spans, tension, tracking
+from . import clicking, history, kovaaks, report, sens, session, spans, tension, tracking
 from .format import read_spot
 
 REPO = Path(__file__).resolve().parents[2]
@@ -99,7 +99,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{name}: {e}", file=sys.stderr)
                 continue
             mode, result = "tracking", tracking.analyze(run)   # no kills after all
-        tens = tension.analyze(run, mode, tension.mm_per_deg(st.fields if st else None))
+        fields = st.fields if st else None
+        sens.attach(result, run, fields)
+        tens = tension.analyze(run, mode, tension.mm_per_deg(fields, run))
         rec = history.make_record(name, mode, st, result, tens)
         noise, context = None, []
         if st:

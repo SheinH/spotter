@@ -1,4 +1,4 @@
-""".spot log reader/writer. Mirrors hook/src/format.h (version 2; version 1 logs still read)."""
+""".spot log reader/writer. Mirrors hook/src/format.h (version 3; versions 1-2 still read)."""
 from __future__ import annotations
 
 import struct
@@ -8,15 +8,21 @@ from pathlib import Path
 import numpy as np
 
 MAGIC = b"SPOT"
-VERSION = 2
+VERSION = 3
 HEADER = struct.Struct("<4sHHQq40s")
-FRAME = struct.Struct("<Q6fIBBH")
+FRAME = struct.Struct("<Q6fIBBH2f")
+FRAME_V2 = struct.Struct("<Q6fIBBH")   # versions 1-2: no sensitivity fields
+FRAME_COLS = 13                          # frames are held as (N, 13); v1-2 get 0 sens
 TARGET = struct.Struct("<I6f")
 TARGET_V1 = struct.Struct("<I5f")   # no half_height
 NO_SHOTS = 0xFFFFFFFF
 BTN_FIRE = 1
 
-assert HEADER.size == 64 and FRAME.size == 40 and TARGET.size == 28
+assert HEADER.size == 64 and FRAME.size == 48 and FRAME_V2.size == 40 and TARGET.size == 28
+
+
+def frame_struct(version: int) -> struct.Struct:
+    return FRAME if version >= 3 else FRAME_V2
 
 
 @dataclass
@@ -39,6 +45,17 @@ class Run:
     tgt_health: np.ndarray
     start_wall_us: int = 0
     game: str = ""
+    # Live sensitivity (v3 logs; NaN otherwise). Same units, so user_sens / yaw_scale is the
+    # multiplier the sens randomizer has put on the configured cm/360 (>1 = longer distance).
+    yaw_scale: np.ndarray | None = None    # APlayerController::InputYawScale
+    user_sens: np.ndarray | None = None    # AMetaPlayerController::UserYawSensitivity
+
+    def __post_init__(self):
+        n = len(self.t)
+        if self.yaw_scale is None:
+            self.yaw_scale = np.full(n, np.nan)
+        if self.user_sens is None:
+            self.user_sens = np.full(n, np.nan)
 
     def wall(self, t: float) -> float:
         """Unix seconds for log time t."""
@@ -55,7 +72,25 @@ class Run:
             tgt_pos=self.tgt_pos[rows], tgt_radius=self.tgt_radius[rows], tgt_hh=self.tgt_hh[rows],
             tgt_health=self.tgt_health[rows],
             start_wall_us=self.start_wall_us, game=self.game,
+            yaw_scale=self.yaw_scale[keep], user_sens=self.user_sens[keep],
         )
+
+
+def arrays_to_run(fa: np.ndarray, ta: np.ndarray, start_wall_us: int, game: str) -> Run:
+    """fa: (N, FRAME_COLS) frame records; ta: (M, 8) target rows (frame index first)."""
+    shots = fa[:, 7].astype(np.int64)
+    shots[shots == NO_SHOTS] = -1
+    ys, us = fa[:, 11].copy(), fa[:, 12].copy()
+    bad = ~(ys > 0) | ~(us > 0)   # unreadable or pre-v3
+    ys[bad] = np.nan
+    us[bad] = np.nan
+    return Run(
+        t=fa[:, 0] / 1e6, yaw=fa[:, 1], pitch=fa[:, 2], fov=fa[:, 3], cam=fa[:, 4:7],
+        shots=shots, buttons=fa[:, 8].astype(np.uint8),
+        tgt_frame=ta[:, 0].astype(np.int64), tgt_id=ta[:, 1].astype(np.int64),
+        tgt_pos=ta[:, 2:5], tgt_radius=ta[:, 5], tgt_hh=ta[:, 6], tgt_health=ta[:, 7],
+        start_wall_us=start_wall_us, game=game, yaw_scale=ys, user_sens=us,
+    )
 
 
 def read_spot(path: str | Path, v1_hh_ratio: float = 1.0) -> Run:
@@ -66,22 +101,23 @@ def read_spot(path: str | Path, v1_hh_ratio: float = 1.0) -> Run:
     magic, version, header_size, _qpc, start_wall_us, game = HEADER.unpack_from(data, 0)
     if magic != MAGIC:
         raise ValueError(f"{path}: not a .spot file")
-    if version not in (1, VERSION):
+    if version not in (1, 2, VERSION):
         raise ValueError(f"{path}: version {version}, this analyzer reads up to version {VERSION}")
     target = TARGET_V1 if version == 1 else TARGET
+    frame = frame_struct(version)
 
     frames: list[tuple] = []
     targets: list[tuple] = []
     off, end = header_size, len(data)
     # A log cut off mid-record (game closed or crashed) is read up to the last whole frame.
-    while off + FRAME.size <= end:
-        f = FRAME.unpack_from(data, off)
+    while off + frame.size <= end:
+        f = frame.unpack_from(data, off)
         n = f[9]
-        if off + FRAME.size + n * target.size > end:
+        if off + frame.size + n * target.size > end:
             break
-        off += FRAME.size
+        off += frame.size
         i = len(frames)
-        frames.append(f)
+        frames.append(f if version >= 3 else (*f, 0.0, 0.0))
         for _ in range(n):
             rec = target.unpack_from(data, off)
             if version == 1:   # id, pos, radius, health -> insert half_height
@@ -89,17 +125,9 @@ def read_spot(path: str | Path, v1_hh_ratio: float = 1.0) -> Run:
             targets.append((i, *rec))
             off += target.size
 
-    fa = np.array(frames, dtype=np.float64).reshape(-1, 11)
+    fa = np.array(frames, dtype=np.float64).reshape(-1, FRAME_COLS)
     ta = np.array(targets, dtype=np.float64).reshape(-1, 8)
-    shots = fa[:, 7].astype(np.int64)
-    shots[shots == NO_SHOTS] = -1
-    return Run(
-        t=fa[:, 0] / 1e6, yaw=fa[:, 1], pitch=fa[:, 2], fov=fa[:, 3], cam=fa[:, 4:7],
-        shots=shots, buttons=fa[:, 8].astype(np.uint8),
-        tgt_frame=ta[:, 0].astype(np.int64), tgt_id=ta[:, 1].astype(np.int64),
-        tgt_pos=ta[:, 2:5], tgt_radius=ta[:, 5], tgt_hh=ta[:, 6], tgt_health=ta[:, 7],
-        start_wall_us=start_wall_us, game=game.rstrip(b"\0").decode("utf-8", "replace"),
-    )
+    return arrays_to_run(fa, ta, start_wall_us, game.rstrip(b"\0").decode("utf-8", "replace"))
 
 
 def write_spot(path: str | Path, run: Run) -> None:
@@ -110,7 +138,8 @@ def write_spot(path: str | Path, run: Run) -> None:
         a, b = bounds[i], bounds[i + 1]
         shots = NO_SHOTS if run.shots[i] < 0 else int(run.shots[i])
         out += FRAME.pack(int(round(run.t[i] * 1e6)), run.yaw[i], run.pitch[i], run.fov[i],
-                          *run.cam[i], shots, int(run.buttons[i]), b - a, 0)
+                          *run.cam[i], shots, int(run.buttons[i]), b - a, 0,
+                          *(0.0 if v != v else float(v) for v in (run.yaw_scale[i], run.user_sens[i])))
         for r in range(a, b):
             out += TARGET.pack(int(run.tgt_id[r]), *run.tgt_pos[r], run.tgt_radius[r],
                                run.tgt_hh[r], run.tgt_health[r])

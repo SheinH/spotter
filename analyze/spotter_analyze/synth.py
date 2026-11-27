@@ -74,14 +74,17 @@ def _min_jerk(u):
 def clicking(seed: int = 0, kills: int = 40, fps: float = 360.0, react: float = 0.18,
              reach: float = 0.85, radius: float = 25.0, early_every: int = 5,
              lockout_deg: float = 0.0, confirm: float = 0.05, tremor_deg: float = 0.0,
-             tremor_hz: float = 10.0) -> Run:
+             tremor_hz: float = 10.0, stop_skew: float = 1.0) -> Run:
     """One static target at a time. Each kill: wait `react`, flick `reach` of the way
     (0.85 = 15% short), pause, correct onto the centre, confirm 50 ms, shoot.
     Every `early_every`-th kill also fires once at the end of the short first flick.
     `lockout_deg`: after each flick stops, a 10 Hz shake that decays over ~80 ms, with this
     amplitude per 30 deg of flick (bigger flicks, bigger shake).
     `confirm`: seconds on the target before the shot. `tremor_deg`: a steady `tremor_hz`
-    shake of this amplitude on top of everything, the whole run."""
+    shake of this amplitude on top of everything, the whole run.
+    `stop_skew`: reshapes the flick's speed profile by running minimum jerk on time**skew.
+    1 = symmetric; >1 = slow push, late peak, abrupt stop (a hard stop); <1 = quick push, long
+    coast in."""
     rng = np.random.default_rng(seed)
     dt = 1.0 / fps
     cur = np.array([0.0, 0.0])        # crosshair yaw, pitch
@@ -111,7 +114,7 @@ def clicking(seed: int = 0, kills: int = 40, fps: float = 360.0, react: float = 
             emit(start, target)
         steps = int(move * fps)
         for i in range(1, steps + 1):
-            emit(start + _min_jerk(i / steps) * (landing - start), target)
+            emit(start + _min_jerk((i / steps) ** stop_skew) * (landing - start), target)
         stops.append((t_now, dist))
         if early_every and k % early_every == early_every - 1:
             emit(landing, target, fire=True)

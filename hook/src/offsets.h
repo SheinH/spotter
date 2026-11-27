@@ -6,13 +6,13 @@
 
 namespace off {
 
-// PE header of FPSAimTrainer-Win64-Shipping.exe, game version 3.9.13 (2026-11-02)
-constexpr uint32_t kTimeDateStamp = 0x6AE8C5C1;
-constexpr uint32_t kSizeOfImage   = 0x05811000;
+// PE header of FPSAimTrainer-Win64-Shipping.exe (2026-11-17)
+constexpr uint32_t kTimeDateStamp = 0x6AF62811;
+constexpr uint32_t kSizeOfImage   = 0x05806000;
 
 // Globals (RVA from the exe base)
-constexpr uintptr_t GWorld       = 0x052B1AC8;
-constexpr uintptr_t AppendString = 0x015C9460;   // void FName::AppendString(FString&) const
+constexpr uintptr_t GWorld       = 0x052A75C8;
+constexpr uintptr_t AppendString = 0x015C5570;   // void FName::AppendString(FString&) const
 
 // CoreUObject
 constexpr uintptr_t UObject_Class      = 0x10;
@@ -26,6 +26,7 @@ constexpr uintptr_t UGameInstance_LocalPlayers = 0x38;    // TArray<ULocalPlayer
 constexpr uintptr_t UPlayer_PlayerController   = 0x30;
 constexpr uintptr_t APlayerController_AcknowledgedPawn    = 0x2A0;
 constexpr uintptr_t APlayerController_PlayerCameraManager = 0x2B8;
+constexpr uintptr_t APlayerController_InputYawScale      = 0x42C;
 constexpr uintptr_t APlayerCameraManager_POV   = 0x1AE0 + 0x10;  // CameraCachePrivate.POV
 constexpr uintptr_t POV_Location = 0x00, POV_Rotation = 0x0C, POV_FOV = 0x18;
 constexpr uintptr_t ULevel_Actors              = 0x98;    // TArray<AActor*>
@@ -36,6 +37,7 @@ constexpr uintptr_t ACharacter_CapsuleComponent = 0x290;
 constexpr uintptr_t UCapsuleComponent_Radius    = 0x464;
 
 // GameSkillsTrainer
+constexpr uintptr_t AMetaPlayerController_UserYawSensitivity = 0x610;
 constexpr uintptr_t AMetaCharacter_CachedWeapons = 0x940;  // TArray<AWeaponParentActor*>
 constexpr uintptr_t AMetaCharacter_Health        = 0xE58;
 constexpr uintptr_t AMetaCharacter_BoundingBox   = 0x610 + 0xE0;  // mCharacterProfileNative.CharBoundingBox

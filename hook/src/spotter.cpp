@@ -1,7 +1,7 @@
 // spotter.dll: read-only telemetry sampler for KovaaK's.
 //
 // One background thread polls the game's memory at 500 Hz and appends camera rotation,
-// shot counter and live target positions to runs/spotter-<time>.spot (see format.h).
+// live sensitivity, shot counter and live target positions to runs/spotter-<time>.spot (see format.h).
 // It never writes to game memory, hooks nothing, and does not hide itself.
 #include <windows.h>
 #include <share.h>
@@ -125,6 +125,8 @@ bool sample_raw(Sample& s) {
     s.frame.cam[0] = loc.x; s.frame.cam[1] = loc.y; s.frame.cam[2] = loc.z;
     s.frame.pitch = rot.x; s.frame.yaw = rot.y;
     s.frame.fov = rd<float>(pov + off::POV_FOV);
+    s.frame.input_yaw_scale = rd<float>(pc + off::APlayerController_InputYawScale);
+    s.frame.user_yaw_sens = rd<float>(pc + off::AMetaPlayerController_UserYawSensitivity);
 
     uint32_t shots = 0;
     bool held = false;
@@ -241,7 +243,8 @@ DWORD WINAPI run(LPVOID) {
     if (!same_build()) {
         logf("this is not the game build the offsets were dumped from; not sampling. "
              "Re-dump the SDK and update hook/src/offsets.h.");
-        return 0;
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        FreeLibraryAndExitThread(g_self, 0);
     }
 
     FILE* out = _wfsopen((dir / (std::wstring(stamp) + L".spot")).c_str(), L"wb", _SH_DENYNO);
@@ -314,11 +317,12 @@ DWORD WINAPI run(LPVOID) {
                 ++written;
             }
         }
-        if (t_us - last_flush_us >= 1000000) { fflush(out); last_flush_us = t_us; }
+        if (t_us - last_flush_us >= 250000) { fflush(out); last_flush_us = t_us; }
         if (t_us - last_beat_us >= 10000000) {
-            logf("frames=%llu skipped_reads=%llu actors=%d targets=%u shots=%u yaw=%.2f pitch=%.2f fov=%.1f",
+            logf("frames=%llu skipped_reads=%llu actors=%d targets=%u shots=%u yaw=%.2f pitch=%.2f fov=%.1f "
+                 "yaw_scale=%.6f user_sens=%.6f",
                  written, faults, s.actors, s.frame.n_targets, s.frame.shots, s.frame.yaw, s.frame.pitch,
-                 s.frame.fov);
+                 s.frame.fov, s.frame.input_yaw_scale, s.frame.user_yaw_sens);
             last_beat_us = t_us;
         }
     }

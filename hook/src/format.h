@@ -1,4 +1,5 @@
-// .spot log layout, version 2 (version 1 had no SpotTarget::half_height). Little-endian, packed.
+// .spot log layout, version 3. Little-endian, packed.
+// Version 1 had no SpotTarget::half_height; version 2 had no SpotFrame sensitivity fields (40-byte frames).
 // Mirrored by analyze/spotter_analyze/format.py; change both together and bump SPOT_VERSION.
 //
 // File  = SpotHeader, then one SpotFrame per rendered frame,
@@ -12,7 +13,7 @@
 #pragma pack(push, 1)
 
 constexpr char     SPOT_MAGIC[4] = {'S', 'P', 'O', 'T'};
-constexpr uint16_t SPOT_VERSION  = 2;
+constexpr uint16_t SPOT_VERSION  = 3;
 constexpr uint32_t SPOT_NO_SHOTS = 0xFFFFFFFFu; // shot counter not available this frame
 constexpr uint8_t  SPOT_BTN_FIRE = 1;
 
@@ -35,8 +36,13 @@ struct SpotFrame {
     uint8_t  buttons;       // SPOT_BTN_* bits
     uint8_t  n_targets;
     uint16_t reserved;
+    // Sensitivity as the engine applies it this frame (KovaaK's sens randomizer changes it live),
+    // and the user's configured value. Same units: degrees per mouse count / 0.07 (the Turn
+    // axis scale), so user / input is the live multiplier on the configured sensitivity.
+    float    input_yaw_scale;   // APlayerController::InputYawScale, 0 if unreadable
+    float    user_yaw_sens;     // AMetaPlayerController::UserYawSensitivity, 0 if unreadable
 };
-static_assert(sizeof(SpotFrame) == 40);
+static_assert(sizeof(SpotFrame) == 48);
 
 struct SpotTarget {
     uint32_t id;            // stable for the life of the target actor

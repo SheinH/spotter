@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from spotter_analyze import clicking, kovaaks, report, synth, tension, tracking
+from spotter_analyze import clicking, kovaaks, report, sens, synth, tension, tracking
 from spotter_analyze.__main__ import main, pick_mode
 from spotter_analyze.format import read_spot, write_spot
 
@@ -101,6 +101,24 @@ def test_tension_flags_flick_rebound():
     assert np.median(clean["flicks"][:, dec] / clean["flicks"][:, acc]) == pytest.approx(1.0, abs=0.1)
 
 
+def test_brake_ratio_tells_hard_stops_from_coasting():
+    def brake(**kw):
+        return clicking.analyze(synth.clicking(kills=40, early_every=0, **kw))["metrics"]["brake_ratio"]
+    sym, hard, coast = brake(), brake(stop_skew=1.6), brake(stop_skew=0.6)
+    assert sym == pytest.approx(1.0, abs=0.1)        # minimum jerk is symmetric
+    assert hard > 1.3
+    assert coast < 0.7
+
+
+def test_post_flick_wobble_sees_shake_not_clean_corrections():
+    clean = clicking.analyze(synth.clicking(kills=40, early_every=0, reach=0.7))   # big but clean corrections
+    shaky = clicking.analyze(synth.clicking(kills=40, early_every=0, lockout_deg=0.15))
+    assert clean["metrics"]["wobble_r"] < 0.02
+    assert shaky["metrics"]["wobble_r"] > 0.08
+    # a symmetric flick with a shake after it is still a symmetric flick
+    assert shaky["metrics"]["brake_ratio"] == pytest.approx(1.0, abs=0.15)
+
+
 def test_tracking_on_target_drops_with_lag():
     good = tracking.analyze(synth.tracking(lag=0.05))["on_pct"]
     bad = tracking.analyze(synth.tracking(lag=0.25))["on_pct"]
@@ -189,6 +207,39 @@ def test_time_budget_adds_up():
     assert sum(v[0] for v in share.values()) == pytest.approx(100, abs=0.5)
     assert math.isnan(rows[-1][5])          # on-target time can't be cut in switching
     assert any("time budget" in s for s in res["summary"])
+
+
+@pytest.mark.parametrize("mode", ["clicking", "switching"])
+def test_flick_micro_phases_add_up(mode):
+    res = clicking.analyze(synth.clicking(kills=40, react=0.18, reach=0.85, early_every=0), mode)
+    for r in res["table"]:
+        assert sum(r["_phase"].values()) == pytest.approx(r["ttk_ms"], abs=0.5)
+        assert min(r["_phase"].values()) >= 0
+    m = res["metrics"]
+    # synth: flick lasts 100 ms + 4 ms/deg (cut a little early at 25% of peak speed), then a 60 ms
+    # pause and an 80 ms correction onto the centre
+    assert m["flick_ms"] == pytest.approx(150, abs=30)
+    assert m["micro_ms"] == pytest.approx(130, abs=30)
+    assert m["flick_on_pct"] == 0
+    assert m["flick_err_pct"] == pytest.approx(15, abs=3)
+    assert any(s.startswith("flick verdict") for s in res["summary"])
+    assert any(s.startswith("micro verdict") for s in res["summary"])
+    assert any(t.startswith("Flick vs micro") for t, _c, _r in res["splits"])
+
+
+def test_exact_flick_needs_no_micro():
+    res = clicking.analyze(synth.clicking(kills=30, reach=1.0, early_every=0))
+    m = res["metrics"]
+    assert m["flick_on_pct"] == 100
+    assert m["micro_ms"] == 0
+    assert m["flick_ms"] == pytest.approx(150, abs=30)
+
+
+def test_micro_blame_goes_to_the_flick_when_micro_is_steady():
+    # every micro in synth is the same 60 ms pause + 80 ms correction, so none of it is the
+    # micro being slower than its own best: it is all the flick's leftover
+    m = clicking.analyze(synth.clicking(kills=40, reach=0.85, early_every=0))["metrics"]
+    assert m["micro_saved_s"] < 0.15 * m["flick_cost_s"]
 
 
 @pytest.mark.parametrize("lag", [0.08, 0.15])
@@ -357,3 +408,79 @@ def test_align_kills_recovers_clock_offset_between_close_kills():
     shift, matched = report.align_kills(mine, game)
     assert shift == pytest.approx(-247, abs=3)
     assert matched >= 98
+
+
+# ---- live sensitivity (format v3) ----
+
+def _with_sens(run, mult):
+    """Configured 0.116633 (35 cm/360 @ 3200 dpi); live scale = configured / mult."""
+    n = len(run.t)
+    run.user_sens = np.full(n, 0.116633)
+    run.yaw_scale = run.user_sens / np.broadcast_to(mult, (n,))
+    return run
+
+
+FIELDS_35 = {"Sens Scale": "cm/360", "Horiz Sens": "35.0", "DPI": "3200", "Sens Increment": "0.116633"}
+
+
+def test_spot_v3_roundtrip_keeps_sens(tmp_path):
+    run = _with_sens(synth.clicking(kills=3), np.linspace(0.75, 1.25, 1))
+    run.yaw_scale[: len(run.t) // 2] *= 1.5
+    write_spot(tmp_path / "a.spot", run)
+    back = read_spot(tmp_path / "a.spot")
+    np.testing.assert_allclose(back.yaw_scale, run.yaw_scale, rtol=1e-6)
+    np.testing.assert_allclose(back.user_sens, run.user_sens, rtol=1e-6)
+    sl = back.slice(back.t[10], back.t[50])
+    assert len(sl.yaw_scale) == len(sl.t)
+
+
+def test_v2_log_still_reads_without_sens(tmp_path):
+    import struct
+    from spotter_analyze import format as fmt
+    run = synth.clicking(kills=3)
+    write_spot(tmp_path / "a.spot", run)
+    data = bytearray((tmp_path / "a.spot").read_bytes())
+    # rebuild as v2: drop the 8 sens bytes after every frame record
+    out = bytearray(data[:fmt.HEADER.size])
+    struct.pack_into("<H", out, 4, 2)
+    off = fmt.HEADER.size
+    while off < len(data):
+        f = fmt.FRAME.unpack_from(data, off)
+        out += data[off:off + fmt.FRAME_V2.size]
+        off += fmt.FRAME.size
+        out += data[off:off + f[9] * fmt.TARGET.size]
+        off += f[9] * fmt.TARGET.size
+    (tmp_path / "v2.spot").write_bytes(bytes(out))
+    back = read_spot(tmp_path / "v2.spot")
+    assert len(back.t) == len(run.t)
+    assert np.isnan(back.yaw_scale).all()
+    assert sens.analyze(back, FIELDS_35) is None
+    assert tension.mm_per_deg(FIELDS_35, back) == pytest.approx(35 * 10 / 360)
+
+
+def test_sens_steady_is_not_flagged():
+    run = _with_sens(synth.clicking(kills=3), 1.0)
+    sv = sens.analyze(run, FIELDS_35)
+    assert not sv["randomized"] and sv["cm360_median"] == pytest.approx(35.0)
+
+
+def test_sens_randomizer_detected_and_reciprocal():
+    run = synth.clicking(kills=3)
+    n = len(run.t)
+    # engine scale 0.155377 = turns further per count than configured -> fewer cm per 360
+    run = _with_sens(run, 1.0)
+    run.yaw_scale[n // 2:] = 0.155377
+    sv = sens.analyze(run, FIELDS_35)
+    assert sv["randomized"] and sv["varies"]
+    assert sv["mult_min"] * 35 == pytest.approx(26.27, abs=0.01)
+    assert sv["mult_max"] * 35 == pytest.approx(35.0)
+    live = sens.cm360(run, FIELDS_35)
+    assert live[0] == pytest.approx(35.0) and live[-1] == pytest.approx(26.27, abs=0.01)
+    mmpd = tension.mm_per_deg(FIELDS_35, run)
+    assert mmpd.shape == run.t.shape
+    tension.analyze(run, "clicking", mmpd)   # per-frame scale runs end to end
+
+
+def test_configured_cm360_from_increment_matches_stats():
+    f = dict(FIELDS_35, **{"Sens Scale": "Overwatch"})
+    assert sens.configured_cm360(f) == pytest.approx(35.0, rel=1e-3)

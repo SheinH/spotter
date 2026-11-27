@@ -1,0 +1,9 @@
+{
+  "daily_target_min": 30.0,
+  "font": "SF Pro Text",
+  "fallback_font": "Segoe UI",
+  "corner": "top-right",
+  "margin_px": 20,
+  "hotkey": "Home",
+  "style": "glass"
+}
